@@ -1,0 +1,40 @@
+# llm_wiki Web 版在 internal-idp(数据应用管理平台,Spring Authorization Server)
+# 中的 OAuth2/OIDC 客户端注册配置。
+#
+# 使用平台自带的注册 CLI 执行(client_secret 由工具随机生成,运行结束打印一次):
+#   java -cp dataAppManager-server-*.jar \
+#        -Dloader.main=com.appmanager.tool.OAuth2ClientRegistrar \
+#        org.springframework.boot.loader.launch.PropertiesLauncher \
+#        deploy/web/oauth2-clients-llm-wiki.yml
+#
+# 打印出的 client_secret 填入 oauth2-proxy.cfg 的 client_secret 字段。
+
+# 按实际环境修改 issuer(与浏览器访问地址一致)
+issuer: https://dap.test.example.internal:7602/dataAppManager-server
+
+# 目标数据库,可复用平台库账号(参照 oauth2-clients-example.yml)
+datasource:
+  driver-class-name: dm.jdbc.driver.DmDriver
+  url: jdbc:dm://127.0.0.1:5236
+  username: SYSDBA
+  password: SYSDBA
+
+clients:
+  - client-id: llm-wiki-web
+    client-name: LLM Wiki Web
+    # oauth2-proxy 支持 PKCE(S256),强制开启
+    require-proof-key: true
+    require-authorization-consent: false
+    client-authentication-methods: [client_secret_basic]
+    authorization-grant-types: [authorization_code, refresh_token]
+    # 必须与 oauth2-proxy 的 redirect_url 逐字符一致
+    redirect-uris:
+      - https://wiki.example.com/oauth2/callback
+    post-logout-redirect-uris:
+      - https://wiki.example.com/
+    scopes: [openid, profile]
+    # oauth2-proxy 会校验 ID Token 并可调用 /userinfo,JWT 格式最稳妥
+    access-token-format: self-contained
+    access-token-ttl-minutes: 30
+    refresh-token-ttl-minutes: 480
+    overwrite: false

@@ -5,6 +5,7 @@ mod commands;
 mod cors;
 mod panic_guard;
 mod proxy;
+mod rpc_bridge;
 mod server_bind;
 mod tray;
 mod types;
@@ -598,6 +599,9 @@ pub fn run() {
             // backend is reachable if tray setup or another integration fails.
             clip_server::start_clip_server(app.handle().clone());
             api_server::start_api_server(app.handle().clone());
+            if std::env::var("LLM_WIKI_WEB_ENABLE").is_ok_and(|v| v == "1") {
+                rpc_bridge::start_rpc_bridge(app.handle().clone());
+            }
             let tray_available = match tray::create_tray(app.handle()) {
                 Ok(()) => true,
                 Err(err) => {

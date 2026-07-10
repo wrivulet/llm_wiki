@@ -1,0 +1,100 @@
+# LLM Wiki Web 版 — Docker Swarm stack
+#
+# 前置步骤:
+#   1. 构建并推送镜像(Swarm 不支持 build:,必须用镜像仓库):
+#        docker build -f deploy/web/Dockerfile -t <registry>/llm-wiki-web:0.6.0 .
+#        docker push <registry>/llm-wiki-web:0.6.0
+#   2. 创建 secrets(client_secret 来自 internal-idp 的 OAuth2ClientRegistrar 输出):
+#        printf '%s' '<client-secret>' | docker secret create llm_wiki_oidc_client_secret -
+#        openssl rand -base64 32 | tr -d '\n' | docker secret create llm_wiki_cookie_secret -
+#   3. 按环境改 OIDC issuer / redirect / 镜像名后部署:
+#        LLM_WIKI_IMAGE=<registry>/llm-wiki-web:0.6.0 \
+#        docker stack deploy -c deploy/web/docker-stack.yml llm-wiki
+#
+# 拓扑:外部 TLS 入口(nginx/Traefik/F5)→ oauth2-proxy:4180 → llm-wiki:19829
+# llm-wiki 不发布任何端口,只在 overlay 网络内可达。
+
+version: "3.8"
+
+services:
+  llm-wiki:
+    image: ${LLM_WIKI_IMAGE:-llm-wiki-web:0.6.0}
+    init: true
+    stop_grace_period: 30s
+    networks:
+      - backend
+    volumes:
+      # 项目数据 + 应用状态(app-state.json、向量库等)。Web 端"打开项目"
+      # 时填的服务器路径应位于 /data 下,例如 /data/projects/my-wiki
+      - llm-wiki-data:/data
+    environment:
+      # 覆盖镜像默认值时在此处调整;LLM API 走公司代理时配置 HTTPS_PROXY 等
+      LLM_WIKI_WEB_BIND: 0.0.0.0
+    deploy:
+      # 有状态单用户应用,必须保持单副本
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 5s
+      resources:
+        limits:
+          memory: 2G
+      # 数据卷为本地卷时,固定节点以免重调度后丢数据:
+      # placement:
+      #   constraints:
+      #     - node.hostname == <your-node>
+
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.8.1
+    networks:
+      - backend
+    ports:
+      # 外层 TLS 终结(nginx/Traefik)反代到本端口;直接暴露时务必换成 443+证书
+      - "4180:4180"
+    secrets:
+      - llm_wiki_oidc_client_secret
+      - llm_wiki_cookie_secret
+    environment:
+      OAUTH2_PROXY_PROVIDER: oidc
+      OAUTH2_PROXY_PROVIDER_DISPLAY_NAME: 数据应用管理平台
+      # internal-idp 的对外 issuer,与其 application 配置及浏览器访问地址一致
+      OAUTH2_PROXY_OIDC_ISSUER_URL: https://dap.test.example.internal:7602/dataAppManager-server
+      OAUTH2_PROXY_CLIENT_ID: llm-wiki-web
+      OAUTH2_PROXY_CLIENT_SECRET_FILE: /run/secrets/llm_wiki_oidc_client_secret
+      OAUTH2_PROXY_COOKIE_SECRET_FILE: /run/secrets/llm_wiki_cookie_secret
+      OAUTH2_PROXY_CODE_CHALLENGE_METHOD: S256
+      # 与 oauth2-clients-llm-wiki.yml 的 redirect-uris 逐字符一致
+      OAUTH2_PROXY_REDIRECT_URL: https://wiki.example.com/oauth2/callback
+      OAUTH2_PROXY_UPSTREAMS: http://llm-wiki:19829
+      OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
+      # Spring Authorization Server 用户不一定有已验证邮箱
+      OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+      OAUTH2_PROXY_INSECURE_OIDC_ALLOW_UNVERIFIED_EMAIL: "true"
+      OAUTH2_PROXY_COOKIE_SECURE: "true"
+      OAUTH2_PROXY_COOKIE_EXPIRE: 8h
+      OAUTH2_PROXY_COOKIE_REFRESH: 25m
+      # 关键:SSE 事件流(/events)需要即时刷出
+      OAUTH2_PROXY_FLUSH_INTERVAL: 1s
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 5s
+
+networks:
+  backend:
+    driver: overlay
+    driver_opts:
+      # 跨节点时加密业务流量(桥接本身是明文 HTTP)
+      encrypted: "true"
+
+volumes:
+  llm-wiki-data:
+
+secrets:
+  llm_wiki_oidc_client_secret:
+    external: true
+  llm_wiki_cookie_secret:
+    external: true

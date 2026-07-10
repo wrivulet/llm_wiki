@@ -27,7 +27,42 @@ oauth2-proxy 对接 internal-idp(OIDC)完成。
   Web 工作在 `web` 分支,定期 `git merge main`。
 - 上游改动命令签名时,`rpc_bridge.rs` 的分发表会编译失败,按编译错误跟进即可。
 
-## 构建
+## Docker 部署(推荐)
+
+```bash
+# 构建镜像(仓库根目录;三阶段:前端 → Rust 编译 → xvfb 运行时)
+docker build -f deploy/web/Dockerfile -t <registry>/llm-wiki-web:0.6.0 .
+docker push <registry>/llm-wiki-web:0.6.0
+
+# 创建 Swarm secrets
+printf '%s' '<OAuth2ClientRegistrar 打印的 client-secret>' | \
+  docker secret create llm_wiki_oidc_client_secret -
+openssl rand -base64 32 | tr -d '\n' | \
+  docker secret create llm_wiki_cookie_secret -
+
+# 部署 stack(先按环境改 docker-stack.yml 里的 issuer / redirect)
+LLM_WIKI_IMAGE=<registry>/llm-wiki-web:0.6.0 \
+  docker stack deploy -c deploy/web/docker-stack.yml llm-wiki
+```
+
+要点:
+
+- `llm-wiki` 服务不发布端口,只在 overlay 网络内被 oauth2-proxy 反代;
+  对外只暴露 oauth2-proxy 的 4180,外层再由 nginx/Traefik 终结 TLS。
+- 有状态单用户应用,`replicas` 必须为 1;项目数据和应用状态都在
+  `llm-wiki-data` 卷的 `/data` 下,Web 端"打开项目"填的路径也应在
+  `/data` 下(如 `/data/projects/my-wiki`)。本地卷需固定 placement 节点。
+- 镜像内置 pdfium(`PDFIUM_DYNAMIC_LIB_PATH`)和 dist-web 静态托管;
+  未包含 Node 运行时与 mcp-server(容器场景用不到桌面侧 MCP 分发)。
+- 处理中文 PDF 需要渲染字体时,可在运行时阶段追加 `fonts-noto-cjk`。
+- **容器必须带 init 进程**(stack 已配 `init: true`):`xvfb-run` 作为 PID 1 时
+  Xvfb 的 SIGUSR1 就绪握手失效,会永远卡在等待、应用不启动且无任何日志。
+- 本地(非 Swarm)验证:`docker run --rm --init -p 127.0.0.1:19829:19829 -v llm-wiki-data:/data <image>`,
+  浏览器直接访问 http://127.0.0.1:19829(仅限本机调试,无认证;注意 `--init` 必不可少)。
+- 镜像构建用 thin LTO 覆盖上游的 fat LTO profile(Dockerfile 内 `CARGO_PROFILE_RELEASE_*`
+  环境变量),否则链接期在小内存构建机上会被 OOM 杀掉;二进制略增大,服务端无感。
+
+## 手工构建(不用 Docker 时)
 
 ```bash
 # 前端(本机只需 Node)

@@ -1,4 +1,4 @@
-//! RPC bridge for the web build (POC).
+//! RPC bridge for the web build.
 //!
 //! Exposes a subset of the Tauri commands over plain HTTP so the web
 //! frontend (built with `npm run build:web`, using src-web/shims/*) can
@@ -18,6 +18,10 @@
 //!                              runs unchanged
 //!   GET  /*                  — static files from $LLM_WIKI_WEB_DIST (SPA fallback)
 //!
+//! Server: axum on tauri's tokio runtime. (First cut used tiny_http, whose
+//! per-connection BufWriter never flushes until a response *ends* — fatal
+//! for SSE and streamed proxy bodies.)
+//!
 //! Security model: the bridge itself performs NO authentication and, like
 //! the Tauri IPC it mirrors, accepts absolute filesystem paths. It binds
 //! to 127.0.0.1 by default and MUST only be exposed through an
@@ -26,25 +30,31 @@
 //! LLM_WIKI_WEB_BIND.
 
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::thread;
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{any, get, post};
+use axum::Router;
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::OnceLock;
 use tauri::{AppHandle, Listener, Manager};
 use tauri_plugin_store::StoreExt;
-use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 use crate::commands;
 use crate::commands::search::SearchEmbeddingConfig;
 
 const DEFAULT_PORT: u16 = 19829;
-const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
-const SSE_KEEPALIVE: Duration = Duration::from_secs(15);
+const MAX_BODY_BYTES: usize = 40 * 1024 * 1024;
+const MAX_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const UPLOAD_PRUNE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn start_rpc_bridge(app: AppHandle) {
     let host = std::env::var("LLM_WIKI_WEB_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -54,82 +64,34 @@ pub fn start_rpc_bridge(app: AppHandle) {
         .unwrap_or(DEFAULT_PORT);
     let addr = format!("{host}:{port}");
 
-    thread::spawn(move || {
-        let server = match Server::http(&addr) {
-            Ok(server) => server,
+    let router = Router::new()
+        .route("/rpc/{command}", post(handle_rpc))
+        .route("/events", get(handle_events))
+        .route("/store/{name}", get(handle_store_get).post(handle_store_set))
+        .route("/asset", get(handle_asset))
+        .route("/upload", post(handle_upload))
+        .route("/proxy", any(handle_proxy))
+        .fallback(get(handle_static))
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES as usize))
+        .with_state(app.clone());
+
+    tauri::async_runtime::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => listener,
             Err(err) => {
                 eprintln!("[RPC Bridge] failed to bind {addr}: {err}");
                 return;
             }
         };
         eprintln!("[RPC Bridge] listening on http://{addr}");
-
-        for request in server.incoming_requests() {
-            let app = app.clone();
-            thread::spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle_request(app, request);
-                }));
-                if let Err(payload) = result {
-                    eprintln!("[RPC Bridge] request handler panicked: {payload:?}");
-                }
-            });
+        if let Err(err) = axum::serve(listener, router).await {
+            eprintln!("[RPC Bridge] server error: {err}");
         }
     });
 }
 
-fn handle_request(app: AppHandle, mut request: tiny_http::Request) {
-    let method = request.method().clone();
-    let url = request.url().to_string();
-    let (path, query) = match url.split_once('?') {
-        Some((p, q)) => (p.to_string(), Some(q.to_string())),
-        None => (url.clone(), None),
-    };
-
-    match (&method, path.as_str()) {
-        (Method::Post, p) if p.starts_with("/rpc/") => {
-            let cmd = p.trim_start_matches("/rpc/").to_string();
-            let body = match read_body(&mut request) {
-                Ok(body) => body,
-                Err(err) => return respond_error(request, 400, &err),
-            };
-            let args: Value = if body.trim().is_empty() {
-                json!({})
-            } else {
-                match serde_json::from_str(&body) {
-                    Ok(v) => v,
-                    Err(err) => return respond_error(request, 400, &format!("Invalid JSON: {err}")),
-                }
-            };
-            match dispatch(&app, &cmd, args) {
-                Ok(value) => respond_json(request, 200, value),
-                Err(DispatchError::Unknown) => respond_error(
-                    request,
-                    501,
-                    &format!("Command '{cmd}' is not bridged yet"),
-                ),
-                Err(DispatchError::Command(msg)) => respond_error(request, 400, &msg),
-            }
-        }
-        (Method::Get, "/events") => handle_events(app, request, query.as_deref()),
-        (Method::Get, p) if p.starts_with("/store/") => {
-            let name = p.trim_start_matches("/store/").to_string();
-            handle_store_get(app, request, &name)
-        }
-        (Method::Post, p) if p.starts_with("/store/") => {
-            let name = p.trim_start_matches("/store/").to_string();
-            let body = match read_body(&mut request) {
-                Ok(body) => body,
-                Err(err) => return respond_error(request, 400, &err),
-            };
-            handle_store_set(app, request, &name, &body)
-        }
-        (Method::Get, "/asset") => handle_asset(request, query.as_deref()),
-        (Method::Post, "/upload") => handle_upload(request),
-        (_, "/proxy") => handle_proxy(request),
-        (Method::Get, _) => handle_static(request, &path),
-        _ => respond_error(request, 405, "Method not allowed"),
-    }
+fn error_response(status: StatusCode, message: &str) -> Response {
+    (status, axum::Json(json!({ "error": message }))).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -149,19 +111,38 @@ fn ok<T: serde::Serialize>(value: T) -> Result<Value, DispatchError> {
     serde_json::to_value(value).map_err(|e| DispatchError::Command(e.to_string()))
 }
 
-fn run<T: serde::Serialize>(
-    fut: impl std::future::Future<Output = Result<T, String>>,
-) -> Result<Value, DispatchError> {
-    match tauri::async_runtime::block_on(fut) {
+fn done<T: serde::Serialize>(result: Result<T, String>) -> Result<Value, DispatchError> {
+    match result {
         Ok(value) => ok(value),
         Err(err) => Err(DispatchError::Command(err)),
     }
 }
 
-fn done<T: serde::Serialize>(result: Result<T, String>) -> Result<Value, DispatchError> {
-    match result {
-        Ok(value) => ok(value),
-        Err(err) => Err(DispatchError::Command(err)),
+async fn handle_rpc(
+    State(app): State<AppHandle>,
+    UrlPath(command): UrlPath<String>,
+    body: String,
+) -> Response {
+    if body.len() > MAX_BODY_BYTES {
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE, "Request body too large");
+    }
+    let args: Value = if body.trim().is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(err) => {
+                return error_response(StatusCode::BAD_REQUEST, &format!("Invalid JSON: {err}"))
+            }
+        }
+    };
+    match dispatch(&app, &command, args).await {
+        Ok(value) => axum::Json(value).into_response(),
+        Err(DispatchError::Unknown) => error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            &format!("Command '{command}' is not bridged yet"),
+        ),
+        Err(DispatchError::Command(msg)) => error_response(StatusCode::BAD_REQUEST, &msg),
     }
 }
 
@@ -269,9 +250,105 @@ struct SearchProjectArgs {
     embedding_config: Option<SearchEmbeddingConfig>,
 }
 
-fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, DispatchError> {
+async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, DispatchError> {
     use commands::{file_history, file_sync, fs as cfs, project, search};
     match cmd {
+        "read_file" => {
+            let a: ReadFileArgs = parse(args)?;
+            done(cfs::read_file(a.path, a.extract_images).await)
+        }
+        "write_file" => {
+            let a: WriteFileArgs = parse(args)?;
+            done(cfs::write_file(a.path, a.contents).await)
+        }
+        "write_file_atomic" => {
+            let a: WriteFileArgs = parse(args)?;
+            done(cfs::write_file_atomic(a.path, a.contents).await)
+        }
+        "write_file_base64" => {
+            let a: WriteBase64Args = parse(args)?;
+            done(cfs::write_file_base64(a.path, a.base64).await)
+        }
+        "list_directory" => {
+            let a: ListDirectoryArgs = parse(args)?;
+            done(cfs::list_directory(a.path, a.include_hidden, a.max_depth).await)
+        }
+        "copy_file" => {
+            let a: SourceDestArgs = parse(args)?;
+            done(cfs::copy_file(a.source, a.destination).await)
+        }
+        "copy_directory" => {
+            let a: SourceDestArgs = parse(args)?;
+            done(cfs::copy_directory(a.source, a.destination).await)
+        }
+        "preprocess_file" => {
+            let a: PathArgs = parse(args)?;
+            done(cfs::preprocess_file(a.path).await)
+        }
+        "delete_file" => {
+            let a: PathArgs = parse(args)?;
+            done(cfs::delete_file(a.path).await)
+        }
+        "create_directory" => {
+            let a: PathArgs = parse(args)?;
+            done(cfs::create_directory(a.path).await)
+        }
+        "file_exists" => {
+            let a: PathArgs = parse(args)?;
+            done(cfs::file_exists(a.path).await)
+        }
+        "get_file_modified_time" => {
+            let a: PathArgs = parse(args)?;
+            done(cfs::get_file_modified_time(a.path).await)
+        }
+        "get_file_size" => {
+            let a: PathArgs = parse(args)?;
+            done(cfs::get_file_size(a.path).await)
+        }
+        "get_file_md5" => {
+            let a: PathArgs = parse(args)?;
+            done(cfs::get_file_md5(a.path).await)
+        }
+        "read_file_as_base64" => {
+            let a: PathArgs = parse(args)?;
+            done(cfs::read_file_as_base64(a.path).await)
+        }
+        "find_related_wiki_pages" => {
+            let a: RelatedPagesArgs = parse(args)?;
+            done(cfs::find_related_wiki_pages(a.project_path, a.source_name).await)
+        }
+        "create_project" => {
+            let a: CreateProjectArgs = parse(args)?;
+            done(project::create_project(a.name, a.path))
+        }
+        "open_project" => {
+            let a: PathArgs = parse(args)?;
+            done(project::open_project(a.path))
+        }
+        "search_project" => {
+            let a: SearchProjectArgs = parse(args)?;
+            done(
+                search::search_project(
+                    a.project_path,
+                    a.query,
+                    a.top_k,
+                    a.include_content,
+                    a.query_embedding,
+                    a.embedding_config,
+                )
+                .await,
+            )
+        }
+        "list_file_history" => {
+            let a: FileHistoryArgs = parse(args)?;
+            done(file_history::list_file_history(a.project_path, a.file_path).await)
+        }
+        "restore_file_history" => {
+            let a: RestoreHistoryArgs = parse(args)?;
+            done(
+                file_history::restore_file_history(a.project_path, a.file_path, a.entry_id).await,
+            )
+        }
         "start_project_file_watcher" => {
             let a: WatcherArgs = parse(args)?;
             done(file_sync::start_project_file_watcher(
@@ -314,106 +391,12 @@ fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, DispatchEr
                 a.task_id,
             ))
         }
-        "list_file_history" => {
-            let a: FileHistoryArgs = parse(args)?;
-            run(file_history::list_file_history(a.project_path, a.file_path))
-        }
-        "restore_file_history" => {
-            let a: RestoreHistoryArgs = parse(args)?;
-            run(file_history::restore_file_history(
-                a.project_path,
-                a.file_path,
-                a.entry_id,
-            ))
-        }
-        "read_file" => {
-            let a: ReadFileArgs = parse(args)?;
-            run(cfs::read_file(a.path, a.extract_images))
-        }
-        "write_file" => {
-            let a: WriteFileArgs = parse(args)?;
-            run(cfs::write_file(a.path, a.contents))
-        }
-        "write_file_atomic" => {
-            let a: WriteFileArgs = parse(args)?;
-            run(cfs::write_file_atomic(a.path, a.contents))
-        }
-        "write_file_base64" => {
-            let a: WriteBase64Args = parse(args)?;
-            run(cfs::write_file_base64(a.path, a.base64))
-        }
-        "list_directory" => {
-            let a: ListDirectoryArgs = parse(args)?;
-            run(cfs::list_directory(a.path, a.include_hidden, a.max_depth))
-        }
-        "copy_file" => {
-            let a: SourceDestArgs = parse(args)?;
-            run(cfs::copy_file(a.source, a.destination))
-        }
-        "copy_directory" => {
-            let a: SourceDestArgs = parse(args)?;
-            run(cfs::copy_directory(a.source, a.destination))
-        }
-        "preprocess_file" => {
-            let a: PathArgs = parse(args)?;
-            run(cfs::preprocess_file(a.path))
-        }
-        "delete_file" => {
-            let a: PathArgs = parse(args)?;
-            run(cfs::delete_file(a.path))
-        }
-        "create_directory" => {
-            let a: PathArgs = parse(args)?;
-            run(cfs::create_directory(a.path))
-        }
-        "file_exists" => {
-            let a: PathArgs = parse(args)?;
-            run(cfs::file_exists(a.path))
-        }
-        "get_file_modified_time" => {
-            let a: PathArgs = parse(args)?;
-            run(cfs::get_file_modified_time(a.path))
-        }
-        "get_file_size" => {
-            let a: PathArgs = parse(args)?;
-            run(cfs::get_file_size(a.path))
-        }
-        "get_file_md5" => {
-            let a: PathArgs = parse(args)?;
-            run(cfs::get_file_md5(a.path))
-        }
-        "read_file_as_base64" => {
-            let a: PathArgs = parse(args)?;
-            run(cfs::read_file_as_base64(a.path))
-        }
-        "find_related_wiki_pages" => {
-            let a: RelatedPagesArgs = parse(args)?;
-            run(cfs::find_related_wiki_pages(a.project_path, a.source_name))
-        }
-        "create_project" => {
-            let a: CreateProjectArgs = parse(args)?;
-            match project::create_project(a.name, a.path) {
-                Ok(v) => ok(v),
-                Err(e) => Err(DispatchError::Command(e)),
-            }
-        }
-        "open_project" => {
-            let a: PathArgs = parse(args)?;
-            match project::open_project(a.path) {
-                Ok(v) => ok(v),
-                Err(e) => Err(DispatchError::Command(e)),
-            }
-        }
-        "search_project" => {
-            let a: SearchProjectArgs = parse(args)?;
-            run(search::search_project(
-                a.project_path,
-                a.query,
-                a.top_k,
-                a.include_content,
-                a.query_embedding,
-                a.embedding_config,
-            ))
+        // 状态类小命令:设置页与状态栏轮询,桥接为只读透传
+        "clip_server_status" => ok(crate::clip_server::get_daemon_status().to_string()),
+        "api_server_status" => ok(crate::api_server::get_api_status().to_string()),
+        "api_server_reload_config" => {
+            crate::api_server::invalidate_config_cache();
+            ok("ok".to_string())
         }
         _ => Err(DispatchError::Unknown),
     }
@@ -423,64 +406,51 @@ fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, DispatchEr
 // Server-Sent Events: forward one Tauri event name per connection
 // ---------------------------------------------------------------------------
 
-/// Blocking reader that turns forwarded event payloads into an SSE byte
-/// stream. Dropping it (client disconnect) unlistens from the app event.
-struct SseReader {
-    rx: mpsc::Receiver<String>,
-    pending: Vec<u8>,
+/// Unlistens from the Tauri event when the SSE connection drops.
+struct ListenGuard {
     app: AppHandle,
-    event_id: tauri::EventId,
+    id: tauri::EventId,
 }
 
-impl Drop for SseReader {
+impl Drop for ListenGuard {
     fn drop(&mut self) {
-        self.app.unlisten(self.event_id);
+        self.app.unlisten(self.id);
     }
 }
 
-impl Read for SseReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.pending.is_empty() {
-            match self.rx.recv_timeout(SSE_KEEPALIVE) {
-                Ok(payload) => {
-                    self.pending = format!("data: {payload}\n\n").into_bytes();
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // SSE comment as keepalive; also lets a dead socket
-                    // surface as a write error so we can unlisten.
-                    self.pending = b": keepalive\n\n".to_vec();
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
-            }
-        }
-        let n = self.pending.len().min(buf.len());
-        buf[..n].copy_from_slice(&self.pending[..n]);
-        self.pending.drain(..n);
-        Ok(n)
-    }
+#[derive(Deserialize)]
+struct EventsQuery {
+    name: String,
 }
 
-fn handle_events(app: AppHandle, request: tiny_http::Request, query: Option<&str>) {
-    let Some(name) = query_param(query, "name") else {
-        return respond_error(request, 400, "Missing ?name= event name");
-    };
-
-    let (tx, rx) = mpsc::channel::<String>();
-    let event_id = app.listen_any(name, move |event| {
+async fn handle_events(
+    State(app): State<AppHandle>,
+    Query(query): Query<EventsQuery>,
+) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let id = app.listen_any(query.name, move |event| {
         let _ = tx.send(event.payload().to_string());
     });
-
-    let reader = SseReader {
-        rx,
-        pending: Vec::new(),
-        app,
-        event_id,
+    let guard = ListenGuard {
+        app: app.clone(),
+        id,
     };
-    let response = Response::new(StatusCode(200), Vec::new(), reader, None, None)
-        .with_header(header("Content-Type", "text/event-stream"))
-        .with_header(header("Cache-Control", "no-cache"))
-        .with_header(header("X-Accel-Buffering", "no"));
-    let _ = request.respond(response);
+
+    let stream = futures::stream::unfold((rx, guard), |(mut rx, guard)| async move {
+        let payload = rx.recv().await?;
+        Some((
+            Ok::<_, std::convert::Infallible>(SseEvent::default().data(payload)),
+            (rx, guard),
+        ))
+    });
+
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -495,13 +465,21 @@ fn valid_store_name(name: &str) -> bool {
         && !name.contains("..")
 }
 
-fn handle_store_get(app: AppHandle, request: tiny_http::Request, name: &str) {
-    if !valid_store_name(name) {
-        return respond_error(request, 400, "Invalid store name");
+async fn handle_store_get(
+    State(app): State<AppHandle>,
+    UrlPath(name): UrlPath<String>,
+) -> Response {
+    if !valid_store_name(&name) {
+        return error_response(StatusCode::BAD_REQUEST, "Invalid store name");
     }
-    let store = match app.store(name) {
+    let store = match app.store(&name) {
         Ok(store) => store,
-        Err(err) => return respond_error(request, 500, &format!("Failed to open store: {err}")),
+        Err(err) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to open store: {err}"),
+            )
+        }
     };
     let mut entries = serde_json::Map::new();
     for key in store.keys() {
@@ -509,7 +487,7 @@ fn handle_store_get(app: AppHandle, request: tiny_http::Request, name: &str) {
             entries.insert(key, value);
         }
     }
-    respond_json(request, 200, Value::Object(entries));
+    axum::Json(Value::Object(entries)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -521,27 +499,35 @@ struct StoreSetBody {
     delete: bool,
 }
 
-fn handle_store_set(app: AppHandle, request: tiny_http::Request, name: &str, body: &str) {
-    if !valid_store_name(name) {
-        return respond_error(request, 400, "Invalid store name");
+async fn handle_store_set(
+    State(app): State<AppHandle>,
+    UrlPath(name): UrlPath<String>,
+    axum::Json(body): axum::Json<StoreSetBody>,
+) -> Response {
+    if !valid_store_name(&name) {
+        return error_response(StatusCode::BAD_REQUEST, "Invalid store name");
     }
-    let parsed: StoreSetBody = match serde_json::from_str(body) {
-        Ok(parsed) => parsed,
-        Err(err) => return respond_error(request, 400, &format!("Invalid JSON: {err}")),
-    };
-    let store = match app.store(name) {
+    let store = match app.store(&name) {
         Ok(store) => store,
-        Err(err) => return respond_error(request, 500, &format!("Failed to open store: {err}")),
+        Err(err) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to open store: {err}"),
+            )
+        }
     };
-    if parsed.delete {
-        store.delete(&parsed.key);
+    if body.delete {
+        store.delete(&body.key);
     } else {
-        store.set(&parsed.key, parsed.value);
+        store.set(&body.key, body.value);
     }
     if let Err(err) = store.save() {
-        return respond_error(request, 500, &format!("Failed to save store: {err}"));
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to save store: {err}"),
+        );
     }
-    respond_json(request, 200, json!({ "ok": true }));
+    axum::Json(json!({ "ok": true })).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -574,7 +560,7 @@ const SKIP_RESPONSE_HEADERS: &[&str] = &[
 fn proxy_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        let mut builder = reqwest::Client::builder();
+        let mut builder = reqwest::Client::builder().connect_timeout(PROXY_CONNECT_TIMEOUT);
         // 企业内网的 LLM/搜索端点常由内部 CA 签发;rustls 默认只信任
         // webpki 公共根。通过 PEM bundle 追加信任锚(须为 CA 证书)。
         if let Ok(path) = std::env::var("LLM_WIKI_PROXY_EXTRA_CA") {
@@ -599,109 +585,70 @@ fn proxy_client() -> &'static reqwest::Client {
     })
 }
 
-/// Blocking reader draining proxied response chunks; EOF when the
-/// producer task finishes (or the upstream connection ends).
-struct ByteStreamReader {
-    rx: mpsc::Receiver<Vec<u8>>,
-    pending: Vec<u8>,
-}
-
-impl Read for ByteStreamReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.pending.is_empty() {
-            match self.rx.recv() {
-                Ok(chunk) => self.pending = chunk,
-                Err(_) => return Ok(0),
-            }
-        }
-        let n = self.pending.len().min(buf.len());
-        buf[..n].copy_from_slice(&self.pending[..n]);
-        self.pending.drain(..n);
-        Ok(n)
-    }
-}
-
-fn handle_proxy(mut request: tiny_http::Request) {
-    let Some(target) = request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv(TARGET_HEADER))
-        .map(|h| h.value.as_str().to_string())
+async fn handle_proxy(
+    method: axum::http::Method,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(target) = headers
+        .get(TARGET_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
     else {
-        return respond_error(request, 400, "Missing x-llmwiki-target-url header");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Missing x-llmwiki-target-url header",
+        );
     };
     if !target.starts_with("http://") && !target.starts_with("https://") {
-        return respond_error(request, 400, "Target must be an http(s) URL");
+        return error_response(StatusCode::BAD_REQUEST, "Target must be an http(s) URL");
     }
 
-    let method = match reqwest::Method::from_bytes(request.method().as_str().as_bytes()) {
+    let method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
         Ok(method) => method,
-        Err(_) => return respond_error(request, 405, "Unsupported method"),
+        Err(_) => return error_response(StatusCode::METHOD_NOT_ALLOWED, "Unsupported method"),
     };
 
-    let mut body = Vec::new();
-    if request
-        .as_reader()
-        .take(MAX_BODY_BYTES as u64 + 1)
-        .read_to_end(&mut body)
-        .is_err()
-        || body.len() > MAX_BODY_BYTES
-    {
-        return respond_error(request, 400, "Request body too large or unreadable");
-    }
-
-    let mut upstream = proxy_client().request(method.clone(), &target);
-    for h in request.headers() {
-        let name = h.field.as_str().as_str().to_ascii_lowercase();
-        if SKIP_REQUEST_HEADERS.contains(&name.as_str()) {
+    let mut upstream = proxy_client().request(method, &target);
+    for (name, value) in headers.iter() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if SKIP_REQUEST_HEADERS.contains(&lower.as_str()) {
             continue;
         }
-        upstream = upstream.header(h.field.as_str().as_str(), h.value.as_str());
+        if let Ok(value) = value.to_str() {
+            upstream = upstream.header(name.as_str(), value);
+        }
     }
     if !body.is_empty() {
         upstream = upstream.body(body);
     }
 
-    let resp = match tauri::async_runtime::block_on(upstream.send()) {
+    let resp = match upstream.send().await {
         Ok(resp) => resp,
-        Err(err) => return respond_error(request, 502, &format!("Proxy request failed: {err}")),
+        Err(err) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("Proxy request failed: {err}"),
+            )
+        }
     };
 
-    let status = resp.status().as_u16();
-    let mut headers: Vec<Header> = Vec::new();
+    let mut builder = Response::builder().status(resp.status().as_u16());
     for (name, value) in resp.headers() {
         let lower = name.as_str().to_ascii_lowercase();
         if SKIP_RESPONSE_HEADERS.contains(&lower.as_str()) {
             continue;
         }
-        if let Ok(value) = value.to_str() {
-            if let Ok(h) = Header::from_bytes(name.as_str().as_bytes(), value.as_bytes()) {
-                headers.push(h);
-            }
-        }
+        builder = builder.header(name, value);
     }
-
-    // Stream the body: an async task pulls chunks and feeds the blocking
-    // reader, so LLM SSE responses flow through incrementally.
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    tauri::async_runtime::spawn(async move {
-        let mut resp = resp;
-        while let Ok(Some(chunk)) = resp.chunk().await {
-            if tx.send(chunk.to_vec()).is_err() {
-                break;
-            }
-        }
-    });
-
-    let reader = ByteStreamReader {
-        rx,
-        pending: Vec::new(),
-    };
-    let mut response = Response::new(StatusCode(status), Vec::new(), reader, None, None);
-    for h in headers {
-        response.add_header(h);
-    }
-    let _ = request.respond(response);
+    builder
+        .body(Body::from_stream(resp.bytes_stream()))
+        .unwrap_or_else(|err| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Proxy response error: {err}"),
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -710,9 +657,6 @@ fn handle_proxy(mut request: tiny_http::Request) {
 // relative paths, and the shim hands those server paths to the normal
 // import flow (which copies them into the project's raw/sources).
 // ---------------------------------------------------------------------------
-
-const MAX_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const UPLOAD_PRUNE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn upload_base() -> PathBuf {
     if let Ok(dir) = std::env::var("LLM_WIKI_WEB_UPLOAD_DIR") {
@@ -774,23 +718,28 @@ fn prune_stale_uploads(base: &Path) {
     }
 }
 
-fn handle_upload(mut request: tiny_http::Request) {
-    let header_value = |name: &'static str| {
-        request
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv(name))
-            .map(|h| h.value.as_str().to_string())
+async fn handle_upload(headers: HeaderMap, body: Body) -> Response {
+    let header_value = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
     };
     let Some(token) = header_value("x-llmwiki-upload-dir").filter(|t| valid_upload_token(t))
     else {
-        return respond_error(request, 400, "Missing or invalid x-llmwiki-upload-dir");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Missing or invalid x-llmwiki-upload-dir",
+        );
     };
     let Some(rel) = header_value("x-llmwiki-upload-name")
         .and_then(|v| percent_decode(&v))
         .and_then(|v| sanitize_upload_rel(&v))
     else {
-        return respond_error(request, 400, "Missing or invalid x-llmwiki-upload-name");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Missing or invalid x-llmwiki-upload-name",
+        );
     };
 
     let base = upload_base();
@@ -799,60 +748,95 @@ fn handle_upload(mut request: tiny_http::Request) {
     let session_root = base.join(&token);
     let dest = session_root.join(&rel);
     if let Some(parent) = dest.parent() {
-        if let Err(err) = fs::create_dir_all(parent) {
-            return respond_error(request, 500, &format!("Cannot create staging dir: {err}"));
+        if let Err(err) = tokio::fs::create_dir_all(parent).await {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Cannot create staging dir: {err}"),
+            );
         }
     }
 
-    let mut file = match fs::File::create(&dest) {
+    let mut file = match tokio::fs::File::create(&dest).await {
         Ok(file) => file,
-        Err(err) => return respond_error(request, 500, &format!("Cannot create file: {err}")),
-    };
-    let mut limited = request.as_reader().take(MAX_UPLOAD_BYTES + 1);
-    let written = match std::io::copy(&mut limited, &mut file) {
-        Ok(written) => written,
         Err(err) => {
-            let _ = fs::remove_file(&dest);
-            return respond_error(request, 500, &format!("Upload failed: {err}"));
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Cannot create file: {err}"),
+            )
         }
     };
-    if written > MAX_UPLOAD_BYTES {
-        let _ = fs::remove_file(&dest);
-        return respond_error(request, 413, "File exceeds upload size limit");
+
+    use tokio::io::AsyncWriteExt;
+    let mut written: u64 = 0;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                let _ = tokio::fs::remove_file(&dest).await;
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Upload stream error: {err}"),
+                );
+            }
+        };
+        written += chunk.len() as u64;
+        if written > MAX_UPLOAD_BYTES {
+            let _ = tokio::fs::remove_file(&dest).await;
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "File exceeds upload size limit",
+            );
+        }
+        if let Err(err) = file.write_all(&chunk).await {
+            let _ = tokio::fs::remove_file(&dest).await;
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Upload failed: {err}"),
+            );
+        }
+    }
+    if let Err(err) = file.flush().await {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Upload flush failed: {err}"),
+        );
     }
 
-    respond_json(
-        request,
-        200,
-        json!({
-            "path": dest.to_string_lossy(),
-            "root": session_root.to_string_lossy(),
-        }),
-    );
+    axum::Json(json!({
+        "path": dest.to_string_lossy(),
+        "root": session_root.to_string_lossy(),
+    }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
 // Assets and static files
 // ---------------------------------------------------------------------------
 
-fn handle_asset(request: tiny_http::Request, query: Option<&str>) {
-    let Some(path) = query_param(query, "path") else {
-        return respond_error(request, 400, "Missing ?path=");
-    };
-    serve_file(request, Path::new(&path));
+#[derive(Deserialize)]
+struct AssetQuery {
+    path: String,
 }
 
-fn handle_static(request: tiny_http::Request, url_path: &str) {
+async fn handle_asset(Query(query): Query<AssetQuery>) -> Response {
+    serve_file(Path::new(&query.path)).await
+}
+
+async fn handle_static(uri: axum::http::Uri) -> Response {
     let Some(dist) = std::env::var_os("LLM_WIKI_WEB_DIST") else {
-        return respond_error(
-            request,
-            404,
+        return error_response(
+            StatusCode::NOT_FOUND,
             "Static serving disabled (set LLM_WIKI_WEB_DIST to the dist-web directory)",
         );
     };
     let dist = PathBuf::from(dist);
-    let rel = url_path.trim_start_matches('/');
-    let candidate = if rel.is_empty() { dist.join("index.html") } else { dist.join(rel) };
+    let rel = uri.path().trim_start_matches('/');
+    let candidate = if rel.is_empty() {
+        dist.join("index.html")
+    } else {
+        dist.join(rel)
+    };
 
     let resolved = candidate
         .canonicalize()
@@ -861,20 +845,20 @@ fn handle_static(request: tiny_http::Request, url_path: &str) {
         .filter(|p| dist.canonicalize().map(|d| p.starts_with(d)).unwrap_or(false));
 
     match resolved {
-        Some(file) => serve_file(request, &file),
+        Some(file) => serve_file(&file).await,
         // SPA fallback: unknown non-file routes get index.html
-        None => serve_file(request, &dist.join("index.html")),
+        None => serve_file(&dist.join("index.html")).await,
     }
 }
 
-fn serve_file(request: tiny_http::Request, path: &Path) {
-    match fs::read(path) {
-        Ok(bytes) => {
-            let response = Response::from_data(bytes)
-                .with_header(header("Content-Type", content_type_for(path)));
-            let _ = request.respond(response);
-        }
-        Err(err) => respond_error(request, 404, &format!("Cannot read file: {err}")),
+async fn serve_file(path: &Path) -> Response {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => (
+            [(header::CONTENT_TYPE, content_type_for(path))],
+            bytes,
+        )
+            .into_response(),
+        Err(err) => error_response(StatusCode::NOT_FOUND, &format!("Cannot read file: {err}")),
     }
 }
 
@@ -901,49 +885,6 @@ fn content_type_for(path: &Path) -> &'static str {
         "md" | "txt" => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
-}
-
-// ---------------------------------------------------------------------------
-// Small HTTP helpers
-// ---------------------------------------------------------------------------
-
-fn header(name: &str, value: &str) -> Header {
-    Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("static header")
-}
-
-fn read_body(request: &mut tiny_http::Request) -> Result<String, String> {
-    let mut limited = request.as_reader().take(MAX_BODY_BYTES as u64 + 1);
-    let mut body = String::new();
-    limited
-        .read_to_string(&mut body)
-        .map_err(|e| format!("Failed to read body: {e}"))?;
-    if body.len() > MAX_BODY_BYTES {
-        return Err("Request body too large".to_string());
-    }
-    Ok(body)
-}
-
-fn respond_json(request: tiny_http::Request, status: u16, body: Value) {
-    let data = body.to_string();
-    let response = Response::from_string(data)
-        .with_status_code(StatusCode(status))
-        .with_header(header("Content-Type", "application/json"));
-    let _ = request.respond(response);
-}
-
-fn respond_error(request: tiny_http::Request, status: u16, message: &str) {
-    respond_json(request, status, json!({ "error": message }));
-}
-
-fn query_param(query: Option<&str>, key: &str) -> Option<String> {
-    let query = query?;
-    for pair in query.split('&') {
-        let (k, v) = pair.split_once('=')?;
-        if k == key {
-            return percent_decode(v);
-        }
-    }
-    None
 }
 
 fn percent_decode(value: &str) -> Option<String> {

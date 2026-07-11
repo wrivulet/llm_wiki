@@ -573,7 +573,30 @@ const SKIP_RESPONSE_HEADERS: &[&str] = &[
 
 fn proxy_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(|| {
+        let mut builder = reqwest::Client::builder();
+        // 企业内网的 LLM/搜索端点常由内部 CA 签发;rustls 默认只信任
+        // webpki 公共根。通过 PEM bundle 追加信任锚(须为 CA 证书)。
+        if let Ok(path) = std::env::var("LLM_WIKI_PROXY_EXTRA_CA") {
+            match fs::read(&path) {
+                Ok(pem) => match reqwest::Certificate::from_pem_bundle(&pem) {
+                    Ok(certs) => {
+                        for cert in certs {
+                            builder = builder.add_root_certificate(cert);
+                        }
+                        eprintln!("[RPC Bridge] loaded extra proxy CA bundle from {path}");
+                    }
+                    Err(err) => {
+                        eprintln!("[RPC Bridge] invalid extra CA bundle {path}: {err}")
+                    }
+                },
+                Err(err) => eprintln!("[RPC Bridge] cannot read extra CA {path}: {err}"),
+            }
+        }
+        builder
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 /// Blocking reader draining proxied response chunks; EOF when the

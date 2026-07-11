@@ -30,9 +30,14 @@ services:
       # 项目数据 + 应用状态(app-state.json、向量库等)。Web 端"打开项目"
       # 时填的服务器路径应位于 /data 下,例如 /data/projects/my-wiki
       - llm-wiki-data:/data
+    configs:
+      # 内部根 CA:/proxy 出站访问内网 LLM/搜索端点时的 TLS 信任锚
+      - source: chinalife_test_root_ca
+        target: /etc/ssl/chinalife-test-root-ca.pem
     environment:
       # 覆盖镜像默认值时在此处调整;LLM API 走公司代理时配置 HTTPS_PROXY 等
       LLM_WIKI_WEB_BIND: 0.0.0.0
+      LLM_WIKI_PROXY_EXTRA_CA: /etc/ssl/chinalife-test-root-ca.pem
     deploy:
       # 有状态单用户应用,必须保持单副本
       replicas: 1
@@ -122,6 +127,9 @@ volumes:
 configs:
   dbptest_tls_crt:
     external: true
+  # 内部根 CA(公开证书,随仓库分发),stack deploy 时自动创建
+  chinalife_test_root_ca:
+    file: ./chinalife-test-root-ca.pem
 
 secrets:
   llm_wiki_oidc_client_secret:

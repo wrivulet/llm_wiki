@@ -206,6 +206,21 @@ struct CreateProjectArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct FileHistoryArgs {
+    project_path: String,
+    file_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreHistoryArgs {
+    project_path: String,
+    file_path: String,
+    entry_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SearchProjectArgs {
     project_path: String,
     query: String,
@@ -216,8 +231,20 @@ struct SearchProjectArgs {
 }
 
 fn dispatch(_app: &AppHandle, cmd: &str, args: Value) -> Result<Value, DispatchError> {
-    use commands::{fs as cfs, project, search};
+    use commands::{file_history, fs as cfs, project, search};
     match cmd {
+        "list_file_history" => {
+            let a: FileHistoryArgs = parse(args)?;
+            run(file_history::list_file_history(a.project_path, a.file_path))
+        }
+        "restore_file_history" => {
+            let a: RestoreHistoryArgs = parse(args)?;
+            run(file_history::restore_file_history(
+                a.project_path,
+                a.file_path,
+                a.entry_id,
+            ))
+        }
         "read_file" => {
             let a: ReadFileArgs = parse(args)?;
             run(cfs::read_file(a.path, a.extract_images))

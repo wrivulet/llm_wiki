@@ -21,6 +21,7 @@ export default defineConfig(async (env: ConfigEnv): Promise<UserConfig> => {
         "@tauri-apps/api/core": shim("core"),
         "@tauri-apps/api/event": shim("event"),
         "@tauri-apps/api/window": shim("window"),
+        "@tauri-apps/plugin-http": shim("plugin-http"),
         "@tauri-apps/plugin-store": shim("plugin-store"),
         "@tauri-apps/plugin-dialog": shim("plugin-dialog"),
         "@tauri-apps/plugin-opener": shim("plugin-opener"),
@@ -36,6 +37,8 @@ export default defineConfig(async (env: ConfigEnv): Promise<UserConfig> => {
         "/store": BRIDGE_TARGET,
         "/asset": BRIDGE_TARGET,
         "/events": BRIDGE_TARGET,
+        "/proxy": BRIDGE_TARGET,
+        "/upload": BRIDGE_TARGET,
       },
     },
   } satisfies UserConfig)

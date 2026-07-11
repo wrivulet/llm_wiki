@@ -9,6 +9,13 @@
 //!   GET  /store/{name}       — all entries of a tauri-plugin-store file
 //!   POST /store/{name}       — {key, value, delete?} set/delete one entry
 //!   GET  /asset?path={p}     — raw file bytes (convertFileSrc equivalent)
+//!   *    /proxy              — streaming HTTP proxy to the URL in the
+//!                              x-llmwiki-target-url header (web equivalent of
+//!                              tauri-plugin-http: CORS-hostile LLM endpoints)
+//!   POST /upload             — receive one browser-picked file into a
+//!                              server-side staging dir; the dialog shim then
+//!                              returns that path so the desktop import flow
+//!                              runs unchanged
 //!   GET  /*                  — static files from $LLM_WIKI_WEB_DIST (SPA fallback)
 //!
 //! Security model: the bridge itself performs NO authentication and, like
@@ -27,7 +34,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Listener};
+use std::sync::OnceLock;
+use tauri::{AppHandle, Listener, Manager};
 use tauri_plugin_store::StoreExt;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
@@ -117,6 +125,8 @@ fn handle_request(app: AppHandle, mut request: tiny_http::Request) {
             handle_store_set(app, request, &name, &body)
         }
         (Method::Get, "/asset") => handle_asset(request, query.as_deref()),
+        (Method::Post, "/upload") => handle_upload(request),
+        (_, "/proxy") => handle_proxy(request),
         (Method::Get, _) => handle_static(request, &path),
         _ => respond_error(request, 405, "Method not allowed"),
     }
@@ -143,6 +153,13 @@ fn run<T: serde::Serialize>(
     fut: impl std::future::Future<Output = Result<T, String>>,
 ) -> Result<Value, DispatchError> {
     match tauri::async_runtime::block_on(fut) {
+        Ok(value) => ok(value),
+        Err(err) => Err(DispatchError::Command(err)),
+    }
+}
+
+fn done<T: serde::Serialize>(result: Result<T, String>) -> Result<Value, DispatchError> {
+    match result {
         Ok(value) => ok(value),
         Err(err) => Err(DispatchError::Command(err)),
     }
@@ -206,6 +223,28 @@ struct CreateProjectArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct WatcherArgs {
+    project_id: String,
+    project_path: String,
+    source_watch_config: Option<commands::file_sync::SourceWatchConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectPathArgs {
+    project_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileTaskArgs {
+    project_id: String,
+    project_path: String,
+    task_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct FileHistoryArgs {
     project_path: String,
     file_path: String,
@@ -230,9 +269,51 @@ struct SearchProjectArgs {
     embedding_config: Option<SearchEmbeddingConfig>,
 }
 
-fn dispatch(_app: &AppHandle, cmd: &str, args: Value) -> Result<Value, DispatchError> {
-    use commands::{file_history, fs as cfs, project, search};
+fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, DispatchError> {
+    use commands::{file_history, file_sync, fs as cfs, project, search};
     match cmd {
+        "start_project_file_watcher" => {
+            let a: WatcherArgs = parse(args)?;
+            done(file_sync::start_project_file_watcher(
+                app.clone(),
+                app.state(),
+                a.project_id,
+                a.project_path,
+                a.source_watch_config,
+            ))
+        }
+        "stop_project_file_watcher" => done(file_sync::stop_project_file_watcher(app.state())),
+        "rescan_project_files" => {
+            let a: WatcherArgs = parse(args)?;
+            done(file_sync::rescan_project_files(
+                app.clone(),
+                a.project_id,
+                a.project_path,
+                a.source_watch_config,
+            ))
+        }
+        "get_file_change_queue" => {
+            let a: ProjectPathArgs = parse(args)?;
+            done(file_sync::get_file_change_queue(a.project_path))
+        }
+        "retry_file_change_task" => {
+            let a: FileTaskArgs = parse(args)?;
+            done(file_sync::retry_file_change_task(
+                app.clone(),
+                a.project_id,
+                a.project_path,
+                a.task_id,
+            ))
+        }
+        "ignore_file_change_task" => {
+            let a: FileTaskArgs = parse(args)?;
+            done(file_sync::ignore_file_change_task(
+                app.clone(),
+                a.project_id,
+                a.project_path,
+                a.task_id,
+            ))
+        }
         "list_file_history" => {
             let a: FileHistoryArgs = parse(args)?;
             run(file_history::list_file_history(a.project_path, a.file_path))
@@ -461,6 +542,270 @@ fn handle_store_set(app: AppHandle, request: tiny_http::Request, name: &str, bod
         return respond_error(request, 500, &format!("Failed to save store: {err}"));
     }
     respond_json(request, 200, json!({ "ok": true }));
+}
+
+// ---------------------------------------------------------------------------
+// Streaming HTTP proxy — web equivalent of tauri-plugin-http. Lets the
+// browser frontend reach CORS-hostile LLM/search endpoints through the
+// backend, mirroring the desktop trust model (any URL, user-configured).
+// Auth is the reverse proxy's job; this port must stay unpublished.
+// ---------------------------------------------------------------------------
+
+const TARGET_HEADER: &str = "x-llmwiki-target-url";
+/// Inbound headers never forwarded upstream: connection metadata plus the
+/// oauth2-proxy session cookie (must not leak to third-party endpoints).
+const SKIP_REQUEST_HEADERS: &[&str] = &[
+    TARGET_HEADER,
+    "host",
+    "cookie",
+    "connection",
+    "content-length",
+    "accept-encoding",
+    "origin",
+    "referer",
+];
+const SKIP_RESPONSE_HEADERS: &[&str] = &[
+    "transfer-encoding",
+    "connection",
+    "content-length",
+    "set-cookie",
+];
+
+fn proxy_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+/// Blocking reader draining proxied response chunks; EOF when the
+/// producer task finishes (or the upstream connection ends).
+struct ByteStreamReader {
+    rx: mpsc::Receiver<Vec<u8>>,
+    pending: Vec<u8>,
+}
+
+impl Read for ByteStreamReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pending.is_empty() {
+            match self.rx.recv() {
+                Ok(chunk) => self.pending = chunk,
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = self.pending.len().min(buf.len());
+        buf[..n].copy_from_slice(&self.pending[..n]);
+        self.pending.drain(..n);
+        Ok(n)
+    }
+}
+
+fn handle_proxy(mut request: tiny_http::Request) {
+    let Some(target) = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv(TARGET_HEADER))
+        .map(|h| h.value.as_str().to_string())
+    else {
+        return respond_error(request, 400, "Missing x-llmwiki-target-url header");
+    };
+    if !target.starts_with("http://") && !target.starts_with("https://") {
+        return respond_error(request, 400, "Target must be an http(s) URL");
+    }
+
+    let method = match reqwest::Method::from_bytes(request.method().as_str().as_bytes()) {
+        Ok(method) => method,
+        Err(_) => return respond_error(request, 405, "Unsupported method"),
+    };
+
+    let mut body = Vec::new();
+    if request
+        .as_reader()
+        .take(MAX_BODY_BYTES as u64 + 1)
+        .read_to_end(&mut body)
+        .is_err()
+        || body.len() > MAX_BODY_BYTES
+    {
+        return respond_error(request, 400, "Request body too large or unreadable");
+    }
+
+    let mut upstream = proxy_client().request(method.clone(), &target);
+    for h in request.headers() {
+        let name = h.field.as_str().as_str().to_ascii_lowercase();
+        if SKIP_REQUEST_HEADERS.contains(&name.as_str()) {
+            continue;
+        }
+        upstream = upstream.header(h.field.as_str().as_str(), h.value.as_str());
+    }
+    if !body.is_empty() {
+        upstream = upstream.body(body);
+    }
+
+    let resp = match tauri::async_runtime::block_on(upstream.send()) {
+        Ok(resp) => resp,
+        Err(err) => return respond_error(request, 502, &format!("Proxy request failed: {err}")),
+    };
+
+    let status = resp.status().as_u16();
+    let mut headers: Vec<Header> = Vec::new();
+    for (name, value) in resp.headers() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if SKIP_RESPONSE_HEADERS.contains(&lower.as_str()) {
+            continue;
+        }
+        if let Ok(value) = value.to_str() {
+            if let Ok(h) = Header::from_bytes(name.as_str().as_bytes(), value.as_bytes()) {
+                headers.push(h);
+            }
+        }
+    }
+
+    // Stream the body: an async task pulls chunks and feeds the blocking
+    // reader, so LLM SSE responses flow through incrementally.
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    tauri::async_runtime::spawn(async move {
+        let mut resp = resp;
+        while let Ok(Some(chunk)) = resp.chunk().await {
+            if tx.send(chunk.to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+
+    let reader = ByteStreamReader {
+        rx,
+        pending: Vec::new(),
+    };
+    let mut response = Response::new(StatusCode(status), Vec::new(), reader, None, None);
+    for h in headers {
+        response.add_header(h);
+    }
+    let _ = request.respond(response);
+}
+
+// ---------------------------------------------------------------------------
+// Browser upload staging — backs the web dialog shim's file/folder picker.
+// Each picker session gets a token dir; files land under it preserving
+// relative paths, and the shim hands those server paths to the normal
+// import flow (which copies them into the project's raw/sources).
+// ---------------------------------------------------------------------------
+
+const MAX_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const UPLOAD_PRUNE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn upload_base() -> PathBuf {
+    if let Ok(dir) = std::env::var("LLM_WIKI_WEB_UPLOAD_DIR") {
+        return PathBuf::from(dir);
+    }
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join(".llm-wiki-web-uploads")
+}
+
+fn valid_upload_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 64
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Relative path from the browser (file name or webkitRelativePath).
+/// Reject anything that could escape the session dir.
+fn sanitize_upload_rel(rel: &str) -> Option<PathBuf> {
+    if rel.is_empty() || rel.len() > 1024 {
+        return None;
+    }
+    let path = Path::new(rel);
+    if path.is_absolute() {
+        return None;
+    }
+    let mut clean = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::Normal(part) => clean.push(part),
+            _ => return None,
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        None
+    } else {
+        Some(clean)
+    }
+}
+
+/// Best-effort removal of stale staging dirs from earlier sessions.
+fn prune_stale_uploads(base: &Path) {
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > UPLOAD_PRUNE_AGE);
+        if stale {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+fn handle_upload(mut request: tiny_http::Request) {
+    let header_value = |name: &'static str| {
+        request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv(name))
+            .map(|h| h.value.as_str().to_string())
+    };
+    let Some(token) = header_value("x-llmwiki-upload-dir").filter(|t| valid_upload_token(t))
+    else {
+        return respond_error(request, 400, "Missing or invalid x-llmwiki-upload-dir");
+    };
+    let Some(rel) = header_value("x-llmwiki-upload-name")
+        .and_then(|v| percent_decode(&v))
+        .and_then(|v| sanitize_upload_rel(&v))
+    else {
+        return respond_error(request, 400, "Missing or invalid x-llmwiki-upload-name");
+    };
+
+    let base = upload_base();
+    prune_stale_uploads(&base);
+
+    let session_root = base.join(&token);
+    let dest = session_root.join(&rel);
+    if let Some(parent) = dest.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            return respond_error(request, 500, &format!("Cannot create staging dir: {err}"));
+        }
+    }
+
+    let mut file = match fs::File::create(&dest) {
+        Ok(file) => file,
+        Err(err) => return respond_error(request, 500, &format!("Cannot create file: {err}")),
+    };
+    let mut limited = request.as_reader().take(MAX_UPLOAD_BYTES + 1);
+    let written = match std::io::copy(&mut limited, &mut file) {
+        Ok(written) => written,
+        Err(err) => {
+            let _ = fs::remove_file(&dest);
+            return respond_error(request, 500, &format!("Upload failed: {err}"));
+        }
+    };
+    if written > MAX_UPLOAD_BYTES {
+        let _ = fs::remove_file(&dest);
+        return respond_error(request, 413, "File exceeds upload size limit");
+    }
+
+    respond_json(
+        request,
+        200,
+        json!({
+            "path": dest.to_string_lossy(),
+            "root": session_root.to_string_lossy(),
+        }),
+    );
 }
 
 // ---------------------------------------------------------------------------

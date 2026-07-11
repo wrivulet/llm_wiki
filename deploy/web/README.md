@@ -5,7 +5,7 @@
 oauth2-proxy 对接 internal-idp(OIDC)完成。
 
 ```
-浏览器 ──HTTPS──▶ oauth2-proxy(:4180, OIDC ⇆ internal-idp)
+浏览器 ──HTTPS:7180──▶ oauth2-proxy(终结 TLS, OIDC ⇆ internal-idp)
                      │ 认证通过后反代
                      ▼
               RPC 桥接(127.0.0.1:19829,进程内)
@@ -37,7 +37,8 @@ docker push <registry>/llm-wiki-web:0.6.0
 # 创建 Swarm secrets
 printf '%s' '<OAuth2ClientRegistrar 打印的 client-secret>' | \
   docker secret create llm_wiki_oidc_client_secret -
-openssl rand -base64 32 | tr -d '\n' | \
+# cookie secret 必须是 URL-safe base64(+/ 换成 -_),否则 oauth2-proxy 报长度错误
+openssl rand -base64 32 | tr -d '\n' | tr -- '+/' '-_' | \
   docker secret create llm_wiki_cookie_secret -
 
 # 部署 stack(先按环境改 docker-stack.yml 里的 issuer / redirect)
@@ -48,7 +49,8 @@ LLM_WIKI_IMAGE=<registry>/llm-wiki-web:0.6.0 \
 要点:
 
 - `llm-wiki` 服务不发布端口,只在 overlay 网络内被 oauth2-proxy 反代;
-  对外只暴露 oauth2-proxy 的 4180,外层再由 nginx/Traefik 终结 TLS。
+  对外只暴露 oauth2-proxy 的 7180(HTTPS,直接终结 TLS,证书走 Swarm
+  secrets `llm_wiki_tls_cert`/`llm_wiki_tls_key`,PEM 格式含完整证书链)。
 - 有状态单用户应用,`replicas` 必须为 1;项目数据和应用状态都在
   `llm-wiki-data` 卷的 `/data` 下,Web 端"打开项目"填的路径也应在
   `/data` 下(如 `/data/projects/my-wiki`)。本地卷需固定 placement 节点。
@@ -98,7 +100,8 @@ xvfb-run -a /opt/llm-wiki/llm-wiki
    (用 `OAuth2ClientRegistrar` CLI 执行,记下打印的 client_secret)。
 2. 填好 `deploy/web/oauth2-proxy.cfg`(client_secret、cookie_secret、域名),
    启动 `oauth2-proxy --config deploy/web/oauth2-proxy.cfg`。
-3. 外层再加 TLS(Caddy/nginx 反代 :4180,或让 oauth2-proxy 直接持证书)。
+3. oauth2-proxy 直接持证书终结 TLS(Swarm 部署见 docker-stack.yml;
+   手工部署见 oauth2-proxy.cfg 的 tls_cert_file/tls_key_file)。
 
 ## 开发
 

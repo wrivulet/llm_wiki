@@ -10,7 +10,7 @@
 # 打印出的 client_secret 填入 oauth2-proxy.cfg 的 client_secret 字段。
 
 # 按实际环境修改 issuer(与浏览器访问地址一致)
-issuer: https://dap.test.example.internal:7602/dataAppManager-server
+issuer: https://dbp.test.example.internal:7602/dataAppManager-server
 
 # 目标数据库,可复用平台库账号(参照 oauth2-clients-example.yml)
 datasource:
@@ -29,9 +29,9 @@ clients:
     authorization-grant-types: [authorization_code, refresh_token]
     # 必须与 oauth2-proxy 的 redirect_url 逐字符一致
     redirect-uris:
-      - https://wiki.example.com/oauth2/callback
+      - https://dbp.test.example.internal:7180/oauth2/callback
     post-logout-redirect-uris:
-      - https://wiki.example.com/
+      - https://dbp.test.example.internal:7180/
     scopes: [openid, profile]
     # oauth2-proxy 会校验 ID Token 并可调用 /userinfo,JWT 格式最稳妥
     access-token-format: self-contained

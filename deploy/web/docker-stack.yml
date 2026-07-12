@@ -38,6 +38,9 @@ services:
       # 覆盖镜像默认值时在此处调整;LLM API 走公司代理时配置 HTTPS_PROXY 等
       LLM_WIKI_WEB_BIND: 0.0.0.0
       LLM_WIKI_PROXY_EXTRA_CA: /etc/ssl/dbp-test-root-ca.pem
+      HTTPS_PROXY: http://da2.example.internal:9996
+      HTTP_PROXY: http://da2.example.internal:9996
+      NO_PROXY: localhost,127.0.0.1,172.16.0.0/12, 192.168.0.0/16
     deploy:
       # 有状态单用户应用,必须保持单副本
       replicas: 1
@@ -65,6 +68,9 @@ services:
       #  含 Chinalife Test Root,叶子证书轮换时信任才不受影响)
       - source: dbptest_tls_crt
         target: /etc/ssl/dbp.test.example.internal.crt
+      # 允许登录的用户名单(一行一个 sub);改名单需升版 config 名再 deploy
+      - source: kb1_users
+        target: /etc/oauth2/kb1-users.txt
     secrets:
       - source: llm_wiki_oidc_client_secret
         target: /run/secrets/llm_wiki_oidc_client_secret
@@ -100,7 +106,9 @@ services:
       OAUTH2_PROXY_SCOPE: openid profile
       # 平台用户无邮箱概念:用 sub(用户名)充当 oauth2-proxy 的用户标识
       OAUTH2_PROXY_OIDC_EMAIL_CLAIM: sub
-      OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+      # 用户白名单(取代 EMAIL_DOMAINS: "*" 的放行所有人);
+      # 临时放开全部用户:注释下行,恢复 OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+      OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE: /etc/oauth2/kb1-users.txt
       OAUTH2_PROXY_INSECURE_OIDC_ALLOW_UNVERIFIED_EMAIL: "true"
       OAUTH2_PROXY_COOKIE_SECURE: "true"
       OAUTH2_PROXY_COOKIE_EXPIRE: 8h
@@ -130,6 +138,10 @@ configs:
   # 内部根 CA(公开证书,随仓库分发),stack deploy 时自动创建
   dbptest_root_ca:
     external: true
+  # 用户白名单,stack deploy 时由仓库文件自动创建;
+  # 改名单后把这里和 service 引用处同时升版(kb1_users_v2)再 deploy
+  kb1_users:
+    file: ./users/kb1.txt
 
 secrets:
   llm_wiki_oidc_client_secret:

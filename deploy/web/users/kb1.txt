@@ -1,0 +1,4 @@
+# llm-wiki(kb1)允许登录的用户名单,一行一个平台用户名(即 OIDC sub)。
+# 注意:Swarm config 不可变——修改本文件后,需把 docker-stack.yml 里的
+# config 名升版(kb1_users → kb1_users_v2)再重新 deploy,旧 config 事后清理。
+why

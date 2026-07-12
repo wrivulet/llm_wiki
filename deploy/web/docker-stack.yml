@@ -2,8 +2,8 @@
 #
 # 前置步骤:
 #   1. 构建并推送镜像(Swarm 不支持 build:,必须用镜像仓库):
-#        docker build -f deploy/web/Dockerfile -t <registry>/llm-wiki-web:0.6.0 .
-#        docker push <registry>/llm-wiki-web:0.6.0
+#        docker build -f deploy/web/Dockerfile -t da2.example.internal:9350/llm-wiki-web:<version> .
+#        docker push da2.example.internal:9350/llm-wiki-web:<version>
 #   2. 创建 secrets(client_secret 来自 internal-idp 的 OAuth2ClientRegistrar 输出;
 #      TLS 证书为 PEM 格式,含完整证书链):
 #        printf '%s' '<client-secret>' | docker secret create llm_wiki_oidc_client_secret -
@@ -14,30 +14,30 @@
 #        docker secret create llm_wiki_tls_cert fullchain.pem
 #        docker secret create llm_wiki_tls_key privkey.pem
 #   3. 按环境改 OIDC issuer / redirect / 镜像名后部署:
-#        LLM_WIKI_IMAGE=<registry>/llm-wiki-web:0.6.0 \
+#        LLM_WIKI_IMAGE=da2.example.internal:9350/llm-wiki-web:<version> \
 #        docker stack deploy -c deploy/web/docker-stack.yml llm-wiki
 #
 # 拓扑:浏览器 —HTTPS:7180→ oauth2-proxy(容器内 4443 终结 TLS)→ llm-wiki:19829
 # llm-wiki 不发布任何端口,只在 overlay 网络内可达。
 services:
   llm-wiki:
-    image: da2.example.internal:9350/llm-wiki-web:0.6.0
+    image: da2.example.internal:9350/llm-wiki-web:0.6.1
     init: true
     stop_grace_period: 30s
     networks:
-      - backend
+      - llm_wiki_net
     volumes:
       # 项目数据 + 应用状态(app-state.json、向量库等)。Web 端"打开项目"
       # 时填的服务器路径应位于 /data 下,例如 /data/projects/my-wiki
-      - llm-wiki-data:/data
+      - /gfsdata/llm-wiki/data:/data
     configs:
       # 内部根 CA:/proxy 出站访问内网 LLM/搜索端点时的 TLS 信任锚
-      - source: chinalife_test_root_ca
-        target: /etc/ssl/chinalife-test-root-ca.pem
+      - source: dbptest_root_ca
+        target: /etc/ssl/dbp-test-root-ca.pem
     environment:
       # 覆盖镜像默认值时在此处调整;LLM API 走公司代理时配置 HTTPS_PROXY 等
       LLM_WIKI_WEB_BIND: 0.0.0.0
-      LLM_WIKI_PROXY_EXTRA_CA: /etc/ssl/chinalife-test-root-ca.pem
+      LLM_WIKI_PROXY_EXTRA_CA: /etc/ssl/dbp-test-root-ca.pem
     deploy:
       # 有状态单用户应用,必须保持单副本
       replicas: 1
@@ -55,7 +55,7 @@ services:
   oauth2-proxy:
     image: da2.example.internal:9350/oauth2-proxy/oauth2-proxy:v7.15.3
     networks:
-      - backend
+      - llm_wiki_net
     ports:
       # oauth2-proxy 直接终结 TLS:对外 7180 → 容器内 4443
       - "7180:4443"
@@ -115,7 +115,7 @@ services:
         delay: 5s
 
 networks:
-  backend:
+  llm_wiki_net:
     driver: overlay
     driver_opts:
       # 跨节点时加密业务流量(桥接本身是明文 HTTP)
@@ -128,8 +128,8 @@ configs:
   dbptest_tls_crt:
     external: true
   # 内部根 CA(公开证书,随仓库分发),stack deploy 时自动创建
-  chinalife_test_root_ca:
-    file: ./chinalife-test-root-ca.pem
+  dbptest_root_ca:
+    external: true
 
 secrets:
   llm_wiki_oidc_client_secret:

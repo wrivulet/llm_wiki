@@ -31,8 +31,8 @@ oauth2-proxy 对接 internal-idp(OIDC)完成。
 
 ```bash
 # 构建镜像(仓库根目录;三阶段:前端 → Rust 编译 → xvfb 运行时)
-docker build -f deploy/web/Dockerfile -t <registry>/llm-wiki-web:0.6.0 .
-docker push <registry>/llm-wiki-web:0.6.0
+docker build -f deploy/web/Dockerfile -t da2.example.internal:9350/llm-wiki-web:<version> .
+docker push da2.example.internal:9350/llm-wiki-web:<version>
 
 # 创建 Swarm secrets
 printf '%s' '<OAuth2ClientRegistrar 打印的 client-secret>' | \
@@ -42,7 +42,7 @@ openssl rand -base64 32 | tr -d '\n' | tr -- '+/' '-_' | \
   docker secret create llm_wiki_cookie_secret -
 
 # 部署 stack(先按环境改 docker-stack.yml 里的 issuer / redirect)
-LLM_WIKI_IMAGE=<registry>/llm-wiki-web:0.6.0 \
+LLM_WIKI_IMAGE=da2.example.internal:9350/llm-wiki-web:<version> \
   docker stack deploy -c deploy/web/docker-stack.yml llm-wiki
 ```
 

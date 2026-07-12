@@ -111,6 +111,12 @@ fn ok<T: serde::Serialize>(value: T) -> Result<Value, DispatchError> {
     serde_json::to_value(value).map_err(|e| DispatchError::Command(e.to_string()))
 }
 
+fn args_field(args: Value, key: &str) -> Result<Value, DispatchError> {
+    args.get(key)
+        .cloned()
+        .ok_or_else(|| DispatchError::Command(format!("Missing field `{key}`")))
+}
+
 fn done<T: serde::Serialize>(result: Result<T, String>) -> Result<Value, DispatchError> {
     match result {
         Ok(value) => ok(value),
@@ -237,6 +243,69 @@ struct RestoreHistoryArgs {
     project_path: String,
     file_path: String,
     entry_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EmbeddingFetchArgs {
+    text: String,
+    cfg: SearchEmbeddingConfig,
+    max_retries: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebSearchArgs {
+    query: String,
+    config: crate::agent::tools::WebSearchConfig,
+    max_results: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnyTxtSearchArgs {
+    query: String,
+    config: crate::agent::tools::AnyTxtConfig,
+    max_results: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PageArgs {
+    project_path: String,
+    page_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VectorUpsertArgs {
+    project_path: String,
+    page_id: String,
+    embedding: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VectorSearchArgs {
+    project_path: String,
+    query_embedding: Vec<f32>,
+    top_k: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChunkUpsertArgs {
+    project_path: String,
+    page_id: String,
+    chunks: Vec<commands::vectorstore::ChunkUpsertInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtractSaveArgs {
+    source_path: String,
+    dest_dir: String,
+    rel_to: String,
 }
 
 #[derive(Deserialize)]
@@ -390,6 +459,115 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Disp
                 a.project_path,
                 a.task_id,
             ))
+        }
+        "embedding_fetch" => {
+            let a: EmbeddingFetchArgs = parse(args)?;
+            done(search::embedding_fetch(a.text, a.cfg, a.max_retries).await)
+        }
+        "web_search" => {
+            let a: WebSearchArgs = parse(args)?;
+            done(commands::external_search::web_search(a.query, a.config, a.max_results).await)
+        }
+        "anytxt_search" => {
+            let a: AnyTxtSearchArgs = parse(args)?;
+            done(commands::external_search::anytxt_search(a.query, a.config, a.max_results).await)
+        }
+        "vector_upsert" => {
+            let a: VectorUpsertArgs = parse(args)?;
+            done(commands::vectorstore::vector_upsert(a.project_path, a.page_id, a.embedding).await)
+        }
+        "vector_search" => {
+            let a: VectorSearchArgs = parse(args)?;
+            done(
+                commands::vectorstore::vector_search(a.project_path, a.query_embedding, a.top_k)
+                    .await,
+            )
+        }
+        "vector_delete" => {
+            let a: PageArgs = parse(args)?;
+            done(commands::vectorstore::vector_delete(a.project_path, a.page_id).await)
+        }
+        "vector_count" => {
+            let a: ProjectPathArgs = parse(args)?;
+            done(commands::vectorstore::vector_count(a.project_path).await)
+        }
+        "vector_upsert_chunks" => {
+            let a: ChunkUpsertArgs = parse(args)?;
+            done(
+                commands::vectorstore::vector_upsert_chunks(a.project_path, a.page_id, a.chunks)
+                    .await,
+            )
+        }
+        "vector_search_chunks" => {
+            let a: VectorSearchArgs = parse(args)?;
+            done(
+                commands::vectorstore::vector_search_chunks(
+                    a.project_path,
+                    a.query_embedding,
+                    a.top_k,
+                )
+                .await,
+            )
+        }
+        "vector_delete_page" => {
+            let a: PageArgs = parse(args)?;
+            done(commands::vectorstore::vector_delete_page(a.project_path, a.page_id).await)
+        }
+        "vector_count_chunks" => {
+            let a: ProjectPathArgs = parse(args)?;
+            done(commands::vectorstore::vector_count_chunks(a.project_path).await)
+        }
+        "vector_clear_chunks" => {
+            let a: ProjectPathArgs = parse(args)?;
+            done(commands::vectorstore::vector_clear_chunks(a.project_path).await)
+        }
+        "vector_optimize_chunks" => {
+            let a: ProjectPathArgs = parse(args)?;
+            done(commands::vectorstore::vector_optimize_chunks(a.project_path).await)
+        }
+        "vector_legacy_row_count" => {
+            let a: ProjectPathArgs = parse(args)?;
+            done(commands::vectorstore::vector_legacy_row_count(a.project_path).await)
+        }
+        "vector_drop_legacy" => {
+            let a: ProjectPathArgs = parse(args)?;
+            done(commands::vectorstore::vector_drop_legacy(a.project_path).await)
+        }
+        "extract_pdf_images_cmd" => {
+            let a: PathArgs = parse(args)?;
+            done(commands::extract_images::extract_pdf_images_cmd(a.path).await)
+        }
+        "extract_office_images_cmd" => {
+            let a: PathArgs = parse(args)?;
+            done(commands::extract_images::extract_office_images_cmd(a.path).await)
+        }
+        "extract_and_save_pdf_images_cmd" => {
+            let a: ExtractSaveArgs = parse(args)?;
+            done(
+                commands::extract_images::extract_and_save_pdf_images_cmd(
+                    a.source_path,
+                    a.dest_dir,
+                    a.rel_to,
+                )
+                .await,
+            )
+        }
+        "extract_and_save_office_images_cmd" => {
+            let a: ExtractSaveArgs = parse(args)?;
+            done(
+                commands::extract_images::extract_and_save_office_images_cmd(
+                    a.source_path,
+                    a.dest_dir,
+                    a.rel_to,
+                )
+                .await,
+            )
+        }
+        // 全局出站代理设置(Settings → Proxy);注意 /proxy 的 reqwest 客户端
+        // 是首次使用时构建的,改代理后需重启进程才对桥接代理生效
+        "set_proxy_env" => {
+            let config: crate::proxy::ProxyConfig = parse(args_field(args, "config")?)?;
+            ok(crate::proxy::apply_proxy_env(&config))
         }
         // 状态类小命令:设置页与状态栏轮询,桥接为只读透传
         "clip_server_status" => ok(crate::clip_server::get_daemon_status().to_string()),

@@ -626,10 +626,18 @@ async fn handle_proxy(
     let resp = match upstream.send().await {
         Ok(resp) => resp,
         Err(err) => {
+            // reqwest 的 Display 只有一句概述;把 source 链拼进来,
+            // 让 DNS 解析失败/连接被拒/TLS 校验失败等根因直接可见
+            let mut detail = err.to_string();
+            let mut source = std::error::Error::source(&err);
+            while let Some(inner) = source {
+                detail.push_str(&format!(": {inner}"));
+                source = inner.source();
+            }
             return error_response(
                 StatusCode::BAD_GATEWAY,
-                &format!("Proxy request failed: {err}"),
-            )
+                &format!("Proxy request failed: {detail}"),
+            );
         }
     };
 

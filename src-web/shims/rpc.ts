@@ -7,6 +7,33 @@
 
 export const RPC_BASE = ""
 
+/**
+ * The desktop app polls its local Web-Clipper daemon (127.0.0.1:19827)
+ * with plain fetch every 3s. In the web build that hits the *user's*
+ * machine, which runs nothing — endless console errors. Intercept that
+ * host and answer with an empty-but-well-formed payload so the watcher
+ * idles silently. (Clipper capture is a desktop-only feature.)
+ */
+const CLIP_SERVER_PREFIX = "http://127.0.0.1:19827/"
+const nativeFetch = globalThis.fetch.bind(globalThis)
+globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+  const url =
+    typeof input === "string"
+      ? input
+      : input instanceof URL
+        ? input.toString()
+        : input.url
+  if (url.startsWith(CLIP_SERVER_PREFIX)) {
+    return Promise.resolve(
+      new Response(JSON.stringify({ ok: false, clips: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    )
+  }
+  return nativeFetch(input as RequestInfo, init)
+}) as typeof globalThis.fetch
+
 export class RpcError extends Error {
   constructor(message: string) {
     super(message)

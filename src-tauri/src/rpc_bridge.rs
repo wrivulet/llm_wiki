@@ -310,6 +310,35 @@ struct ExtractSaveArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AgentTurnArgs {
+    project_id: String,
+    request: crate::agent::AgentChatRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentCancelArgs {
+    project_id: String,
+    session_id: String,
+    run_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentSessionArgs {
+    project_id: String,
+    session_id: String,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectIdArgs {
+    project_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SearchProjectArgs {
     project_path: String,
     query: String,
@@ -562,6 +591,42 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Disp
                 )
                 .await,
             )
+        }
+        // Agent 聊天:流式版立即返回 run_id,过程通过全局 "agent-event"
+        // 事件广播,经 /events SSE 到达前端;与桌面版链路一致
+        "agent_start_turn" => {
+            let a: AgentTurnArgs = parse(args)?;
+            done(crate::agent_start_turn(app.clone(), a.project_id, a.request).await)
+        }
+        "agent_start_turn_stream" => {
+            let a: AgentTurnArgs = parse(args)?;
+            done(crate::agent_start_turn_stream(app.clone(), a.project_id, a.request).await)
+        }
+        "agent_cancel_turn" => {
+            let a: AgentCancelArgs = parse(args)?;
+            done(crate::agent_cancel_turn(
+                app.clone(),
+                a.project_id,
+                a.session_id,
+                a.run_id,
+            ))
+        }
+        "agent_get_session" => {
+            let a: AgentSessionArgs = parse(args)?;
+            done(crate::agent_get_session(
+                app.clone(),
+                a.project_id,
+                a.session_id,
+                a.limit,
+            ))
+        }
+        "agent_list_sessions" => {
+            let a: ProjectIdArgs = parse(args)?;
+            done(crate::agent_list_sessions(app.clone(), a.project_id))
+        }
+        "agent_list_skills" => {
+            let a: ProjectPathArgs = parse(args)?;
+            ok(crate::agent::skills::agent_list_skills(a.project_path))
         }
         // 全局出站代理设置(Settings → Proxy);注意 /proxy 的 reqwest 客户端
         // 是首次使用时构建的,改代理后需重启进程才对桥接代理生效

@@ -74,6 +74,17 @@ COPY --from=backend /build/src-tauri/target/release/llm-wiki /app/llm-wiki
 COPY --from=frontend /build/dist-web /app/dist-web
 COPY src-tauri/pdfium/libpdfium.so /app/pdfium/libpdfium.so
 
+# Remote-MCP sidecar (opt-in, LLM_WIKI_MCP_ENABLE=1 — see docker-entrypoint.sh):
+# a single Node binary lifted from the frontend stage's node:22-bookworm-slim
+# (same Debian bookworm libc/libstdc++/libgcc already present below, so no
+# extra apt packages needed) plus the mcp-server build with dev deps pruned.
+COPY --from=frontend /usr/local/bin/node /usr/local/bin/node
+COPY --from=frontend /build/mcp-server/dist /app/mcp-server/dist
+COPY --from=frontend /build/mcp-server/node_modules /app/mcp-server/node_modules
+COPY --from=frontend /build/mcp-server/package.json /app/mcp-server/package.json
+COPY deploy/web/docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+
 # LLM_WIKI_WEB_BIND=0.0.0.0 仅面向容器内部网络(供 oauth2-proxy 访问),
 # 切勿直接 publish 19829。WEBKIT_DISABLE_* 规避容器内无 GPU 的渲染初始化问题。
 ENV LLM_WIKI_WEB_ENABLE=1 \
@@ -89,8 +100,10 @@ USER app
 # 项目数据与应用状态(plugin-store 等)都落在 /data
 VOLUME /data
 EXPOSE 19829
+# 远程 MCP(可选,见 docker-entrypoint.sh 与 LLM_WIKI_MCP_* 环境变量)
+EXPOSE 3939
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://127.0.0.1:19829/ > /dev/null || exit 1
 
-ENTRYPOINT ["xvfb-run", "-a", "/app/llm-wiki"]
+ENTRYPOINT ["/app/docker-entrypoint.sh"]

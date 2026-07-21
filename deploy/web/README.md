@@ -110,14 +110,63 @@ LLM_WIKI_WEB_ENABLE=1 npm run tauri dev   # 起后端(桥接监听 :19829)
 npm run dev:web                            # 起 web 前端,自动代理桥接端点
 ```
 
+## 远程 MCP(LibreChat 等)
+
+`Settings → API + MCP → Enable MCP access` 里的入口路径只对**桌面版**有意义
+(指向本机 stdio 子进程,供本机 Claude Desktop 配置用)。Web 版走的是
+另一个东西:`mcp-server` 增加了 Streamable HTTP 传输
+([mcp-server/src/http.ts](../../mcp-server/src/http.ts)),作为容器内的
+Node 子进程运行,供 LibreChat 之类的远程 Agent 平台通过网络接入,
+工具集与桌面/本地 MCP 完全一致(`llm_wiki_search`、`llm_wiki_chat`、
+`llm_wiki_graph` 等 9 个工具)。
+
+这是 `llm-wiki` 服务唯一直接发布端口的例外——鉴权用的是服务间静态
+令牌(`Authorization: Bearer`),不是浏览器 OIDC 登录,所以没有接入
+oauth2-proxy;`mcp-server/src/http.ts` 自己校验令牌,自带 TLS(复用同一
+张服务证书)。**没设令牌会拒绝启动;非回环地址绑定又没配 TLS 也会
+拒绝启动**——fail-closed,不会出现"忘了设密钥就裸奔"的情况。
+
+启用步骤:
+
+```bash
+# 1. 建令牌 secret(LibreChat 侧原样使用这个值)
+openssl rand -hex 32 | docker secret create llm_wiki_mcp_token -
+
+# 2. docker-stack.yml 里给 llm-wiki 服务:
+#    - 取消 `ports: - "7189:3939"` 的注释
+#    - LLM_WIKI_MCP_ENABLE 改成 "1"
+#    (TLS 证书/密钥、llm_wiki_mcp_token secret 的挂载已经写好,不用再改)
+
+docker stack deploy -c deploy/web/docker-stack.yml llm-wiki
+```
+
+LibreChat 侧(`librechat.yaml`):
+
+```yaml
+mcpServers:
+  llm-wiki:
+    type: streamable-http
+    url: https://dbp.test.example.internal:7189/mcp
+    headers:
+      Authorization: "Bearer <与 llm_wiki_mcp_token 相同的值>"
+```
+
+本地验证过:容器内启动日志出现 `listening on https://0.0.0.0:3939/mcp`,
+从宿主机通过发布端口以 HTTPS + Bearer token 访问,`tools/list` 正确
+返回全部工具。
+
 ## POC 范围与已知限制
 
-- 已桥接命令:文件系统全套、`open_project`/`create_project`、`search_project`。
-  未桥接的命令返回 501(Agent 聊天流用的是 Tauri Channel,需要后续把
-  `agent_start_turn_stream` 改走 SSE)。
-- 文件选择对话框在 Web 端暂用 prompt 输入服务器路径,后续需要做
-  服务器端文件浏览组件。
-- 桥接本身无认证、接受绝对路径(与桌面 IPC 同权),**必须**只绑定
-  127.0.0.1 并置于 oauth2-proxy 之后;这是单用户模型,不做多租户隔离。
+- 已桥接命令覆盖核心链路:文件系统全套、项目管理、搜索、embedding、
+  向量库、外部搜索、图片提取、Agent 聊天(含流式,走 `/events` SSE)、
+  文件监控、文件历史。桌面语义命令(打开系统文件管理器、本地 CLI 集成、
+  窗口关闭行为)保留 501,浏览器场景下没有对应物。
+- 文件选择对话框:浏览器原生选择器上传到服务器暂存目录
+  (`src-web/shims/plugin-dialog.ts`);目录模式弹出内嵌选择框,
+  区分"上传本机文件夹"与"输入服务器路径"两种语义。
+- 桥接本身(RPC/SSE/proxy/upload,19829 端口)无认证、接受绝对路径
+  (与桌面 IPC 同权),**必须**只绑定 127.0.0.1 并置于 oauth2-proxy 之后;
+  远程 MCP(3939 端口)是唯一的例外,见上一节。这是单用户模型,
+  不做多租户隔离(多知识库场景请每个子集单独部署一套实例)。
 - 浏览器对 HTTP/1.1 同源并发连接有 ~6 个上限,事件流较多时请确保
   外层代理启用 HTTP/2。

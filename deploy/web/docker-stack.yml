@@ -13,12 +13,20 @@
 #          | docker secret create llm_wiki_cookie_secret -
 #        docker secret create llm_wiki_tls_cert fullchain.pem
 #        docker secret create llm_wiki_tls_key privkey.pem
+#      如需给 LibreChat 开远程 MCP(见下方 llm-wiki 的 LLM_WIKI_MCP_* 环境变量):
+#        openssl rand -hex 32 | docker secret create llm_wiki_mcp_token -
 #   3. 按环境改 OIDC issuer / redirect / 镜像名后部署:
 #        LLM_WIKI_IMAGE=da2.example.internal:9350/llm-wiki-web:<version> \
 #        docker stack deploy -c deploy/web/docker-stack.yml llm-wiki
 #
 # 拓扑:浏览器 —HTTPS:7180→ oauth2-proxy(容器内 4443 终结 TLS)→ llm-wiki:19829
-# llm-wiki 不发布任何端口,只在 overlay 网络内可达。
+# llm-wiki 不发布 Web UI 用的端口,只在 overlay 网络内被 oauth2-proxy 访问。
+#
+# 远程 MCP(可选,给 LibreChat 等远程 Agent 用,与浏览器登录无关):
+# LibreChat ─HTTPS:7189/mcp(bearer token)─▶ llm-wiki 容器内 mcp-server 子进程(:3939)
+# 这是 llm-wiki 服务唯一直接发布端口的例外——MCP 走的是服务间静态令牌鉴权,
+# 不是浏览器 OIDC 登录,所以没有走 oauth2-proxy;鉴权由 mcp-server 自己校验
+# Authorization: Bearer,并自带 TLS(复用同一张服务证书)。
 services:
   llm-wiki:
     image: da2.example.internal:9350/llm-wiki-web:0.6.1
@@ -30,10 +38,23 @@ services:
       # 项目数据 + 应用状态(app-state.json、向量库等)。Web 端"打开项目"
       # 时填的服务器路径应位于 /data 下,例如 /data/projects/my-wiki
       - /gfsdata/llm-wiki/data:/data
+    # 远程 MCP(可选,给 LibreChat 用):默认不发布端口。启用时取消下方
+    # `ports:` 注释,并把 environment 里的 LLM_WIKI_MCP_ENABLE 改成 "1":
+    # ports:
+    #   - "7189:3939"
     configs:
       # 内部根 CA:/proxy 出站访问内网 LLM/搜索端点时的 TLS 信任锚
       - source: dbptest_root_ca
         target: /etc/ssl/dbp-test-root-ca.pem
+      # 远程 MCP 用:复用 oauth2-proxy 那张服务证书给 mcp-server 的 HTTPS 监听
+      - source: dbptest_tls_crt
+        target: /etc/ssl/dbp.test.example.internal.crt
+    secrets:
+      # 远程 MCP 用:LibreChat 侧 headers.Authorization 需填同一个值
+      - source: llm_wiki_mcp_token
+        target: /run/secrets/llm_wiki_mcp_token
+      - source: dbptest_tls_key
+        target: /etc/ssl/dbp.test.example.internal.key
     environment:
       # 覆盖镜像默认值时在此处调整;LLM API 走公司代理时配置 HTTPS_PROXY 等
       LLM_WIKI_WEB_BIND: 0.0.0.0
@@ -41,6 +62,12 @@ services:
       HTTPS_PROXY: http://da2.example.internal:9996
       HTTP_PROXY: http://da2.example.internal:9996
       NO_PROXY: localhost,127.0.0.1,172.16.0.0/12, 192.168.0.0/16
+      # 远程 MCP(可选):默认关闭;开启前先取消上面 ports 的注释。
+      # token 不直接写在这里——entrypoint 脚本会从下方 secrets 挂载的
+      # /run/secrets/llm_wiki_mcp_token 读取并导出为 LLM_WIKI_MCP_TOKEN。
+      LLM_WIKI_MCP_ENABLE: "0"
+      LLM_WIKI_MCP_TLS_CERT: /etc/ssl/dbp.test.example.internal.crt
+      LLM_WIKI_MCP_TLS_KEY: /etc/ssl/dbp.test.example.internal.key
     deploy:
       # 有状态单用户应用,必须保持单副本
       replicas: 1
@@ -149,4 +176,7 @@ secrets:
   llm_wiki_cookie_secret:
     external: true
   dbptest_tls_key:
+    external: true
+  # 远程 MCP 用共享令牌;LibreChat 侧原样填入 headers.Authorization
+  llm_wiki_mcp_token:
     external: true

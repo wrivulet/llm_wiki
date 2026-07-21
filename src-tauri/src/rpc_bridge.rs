@@ -624,6 +624,17 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Disp
             let a: ProjectIdArgs = parse(args)?;
             done(crate::agent_list_sessions(app.clone(), a.project_id))
         }
+        // mcp_server_entry_path 返回的是本机 stdio 路径,供本机 Claude
+        // Desktop 配置用——桌面语义在浏览器场景下没有对应物(路径指向
+        // 容器内部,远程客户端无法 spawn 它)。远程 MCP 走独立的
+        // HTTP 端点(见 mcp-server/src/http.ts + LLM_WIKI_MCP_ENABLE),
+        // 与这里无关,不受此提示影响。
+        "mcp_server_entry_path" => Err(DispatchError::Command(
+            "MCP over stdio is a desktop-only feature and has no meaning in the web build. \
+             For remote MCP access (e.g. from LibreChat), enable LLM_WIKI_MCP_ENABLE and see \
+             deploy/web/README.md."
+                .to_string(),
+        )),
         "agent_list_skills" => {
             let a: ProjectPathArgs = parse(args)?;
             ok(crate::agent::skills::agent_list_skills(a.project_path))

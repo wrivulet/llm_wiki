@@ -75,6 +75,9 @@ services:
       LLM_WIKI_MCP_ENABLE: "1"
       LLM_WIKI_MCP_TLS_CERT: /etc/ssl/dbp.test.example.internal.crt
       LLM_WIKI_MCP_TLS_KEY: /etc/ssl/dbp.test.example.internal.key
+      # llm_wiki_search 的引用原文链接用这个拼 /asset?path= 的可点击 URL
+      # (经 oauth2-proxy 的 7180,不是内部的 3939/19829)。留空则不生成链接。
+      LLM_WIKI_PUBLIC_URL: https://dbp.test.example.internal:7180
     deploy:
       # 有状态单用户应用,必须保持单副本
       replicas: 1

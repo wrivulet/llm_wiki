@@ -28,6 +28,8 @@ export interface ApiSearchResult {
   titleMatch?: boolean
   images?: Array<{ url: string; alt: string }>
   vectorScore?: number | null
+  /** Project-relative raw/sources/... paths this wiki page cites. */
+  sources?: string[]
 }
 
 export interface ApiSearchResponse {

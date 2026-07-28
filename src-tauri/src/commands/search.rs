@@ -47,6 +47,16 @@ pub struct ProjectSearchResult {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub graph_related_to: Vec<String>,
+    /// Project-relative paths under raw/sources/ that this page's
+    /// frontmatter `sources:` list cites, resolved against an on-disk
+    /// scan (see build_source_index) so callers — the web MCP bridge in
+    /// particular — can link straight to the original document instead
+    /// of just the LLM-generated wiki summary. Best-effort: falls back
+    /// to `raw/sources/<name>` verbatim if the name isn't found on disk
+    /// (e.g. deleted after ingest), so a case that predates this field
+    /// degrades to a plausible-but-unverified path rather than nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,6 +351,7 @@ pub async fn search_project_inner(
     let mut results = Vec::new();
     let mut page_paths_by_stem = BTreeMap::new();
     let mut graph_pages = BTreeMap::new();
+    let source_index = build_source_index(&project_path);
 
     let wiki_root = Path::new(&project_path).join("wiki");
     if wiki_root.exists() {
@@ -391,6 +402,7 @@ pub async fn search_project_inner(
                 &query_phrase,
                 &query,
                 include_content,
+                &source_index,
             );
             graph_pages.insert(
                 normalize_path(&relative_path),
@@ -439,6 +451,7 @@ pub async fn search_project_inner(
                         &project_path,
                         &mut results,
                         include_content,
+                        &source_index,
                     );
                 }
                 Err(err) => {
@@ -466,6 +479,7 @@ pub async fn search_project_inner(
         limit,
         vector_hits,
         include_content,
+        &source_index,
     );
 
     Ok(ProjectSearchResponse {
@@ -520,6 +534,7 @@ fn blend_graph_results(
     limit: usize,
     vector_hits: usize,
     include_content: bool,
+    source_index: &BTreeMap<String, String>,
 ) -> usize {
     if ranked_results.is_empty() || pages.is_empty() {
         ranked_results.truncate(limit);
@@ -647,6 +662,7 @@ fn blend_graph_results(
             vector_score: None,
             images: extract_image_refs(&page.content),
             content: include_content.then(|| page.content.clone()),
+            sources: resolve_cited_sources(&page.content, source_index),
             graph_related_to: related_titles,
         });
     }
@@ -761,6 +777,7 @@ fn materialize_vector_only_results(
     project_path: &str,
     results: &mut Vec<ProjectSearchResult>,
     include_content: bool,
+    source_index: &BTreeMap<String, String>,
 ) {
     let mut known: BTreeSet<String> = results.iter().map(|r| file_stem(&r.path)).collect();
     for vr in vector_results {
@@ -786,6 +803,7 @@ fn materialize_vector_only_results(
                 score: 0.0,
                 vector_score: Some(vr.score),
                 images: extract_image_refs(&content),
+                sources: resolve_cited_sources(&content, source_index),
                 content: include_content.then_some(content),
                 graph_related_to: Vec::new(),
             });
@@ -819,6 +837,7 @@ fn score_file(
     query_phrase: &str,
     query: &str,
     include_content: bool,
+    source_index: &BTreeMap<String, String>,
 ) -> Option<ProjectSearchResult> {
     let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let title = extract_title(content, file_name);
@@ -873,6 +892,7 @@ fn score_file(
         score,
         vector_score: None,
         images: extract_image_refs(content),
+        sources: resolve_cited_sources(content, source_index),
         content: include_content.then_some(content.to_string()),
         graph_related_to: Vec::new(),
     })
@@ -1028,6 +1048,106 @@ pub fn extract_title(content: &str, file_name: &str) -> String {
         }
     }
     file_name.trim_end_matches(".md").replace('-', " ")
+}
+
+/// One-time recursive scan of `raw/sources/` mapping each file's
+/// lowercased basename to its path relative to the project root.
+/// Called once per search_project_inner call and shared across all
+/// result-building call sites so citing the same source repeatedly
+/// (common — many pages cite the same PDF) doesn't re-walk the tree.
+fn build_source_index(project_path: &str) -> BTreeMap<String, String> {
+    let mut index = BTreeMap::new();
+    let sources_root = Path::new(project_path).join("raw").join("sources");
+    if !sources_root.is_dir() {
+        return index;
+    }
+    for entry in WalkDir::new(&sources_root).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Some(name) = entry.path().file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // First match wins on a duplicate basename in different
+        // subfolders — good enough for a best-effort citation link.
+        index
+            .entry(name.to_lowercase())
+            .or_insert_with(|| relative_to_project(project_path, entry.path()));
+    }
+    index
+}
+
+/// Extracts the raw string values of a wiki page's frontmatter
+/// `sources:` field, handling both the inline `sources: ["a", "b"]`
+/// form and the multi-line YAML list form (quoted or bare entries).
+/// Scoped strictly to the sources block so it can't false-positive on
+/// the filename appearing elsewhere in frontmatter.
+fn extract_frontmatter_sources(content: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    if !content.starts_with("---\n") {
+        return names;
+    }
+    let Some(fm_end_rel) = content[4..].find("\n---") else {
+        return names;
+    };
+    let frontmatter = &content[4..4 + fm_end_rel];
+
+    let parse_list_fragment = |fragment: &str, names: &mut Vec<String>| {
+        for item in fragment.split(',') {
+            let cleaned = item.trim().trim_matches(['[', ']', '"', '\'', '-']).trim();
+            if !cleaned.is_empty() {
+                names.push(cleaned.to_string());
+            }
+        }
+    };
+
+    let mut in_sources_block = false;
+    for line in frontmatter.split('\n') {
+        if let Some(rest) = line.strip_prefix("sources:") {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                // Inline form: sources: ["a.pdf", "b.md"]
+                parse_list_fragment(rest, &mut names);
+            } else {
+                in_sources_block = true;
+            }
+            continue;
+        }
+        if in_sources_block {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if line.starts_with(' ') || line.starts_with('\t') {
+                if let Some(item) = trimmed.strip_prefix('-') {
+                    let cleaned = item.trim().trim_matches(['"', '\'']);
+                    if !cleaned.is_empty() {
+                        names.push(cleaned.to_string());
+                    }
+                }
+            } else {
+                in_sources_block = false;
+            }
+        }
+    }
+    names
+}
+
+/// Resolves a page's cited source names against the project's source
+/// index. Unresolved names (e.g. the source was deleted after ingest)
+/// still get a best-effort `raw/sources/<name>` path rather than being
+/// dropped, so a stale link is preferred over silently losing the
+/// citation.
+fn resolve_cited_sources(content: &str, source_index: &BTreeMap<String, String>) -> Vec<String> {
+    extract_frontmatter_sources(content)
+        .into_iter()
+        .map(|name| {
+            source_index
+                .get(&name.to_lowercase())
+                .cloned()
+                .unwrap_or_else(|| format!("raw/sources/{name}"))
+        })
+        .collect()
 }
 
 pub fn extract_image_refs(content: &str) -> Vec<SearchImageRef> {
@@ -1679,6 +1799,7 @@ mod tests {
             images: vec![],
             content: None,
             graph_related_to: Vec::new(),
+            sources: Vec::new(),
         }
     }
 
@@ -1984,6 +2105,7 @@ mod tests {
             &root.to_string_lossy(),
             &mut results,
             false,
+            &BTreeMap::new(),
         );
 
         assert_eq!(results.len(), 1);

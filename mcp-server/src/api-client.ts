@@ -367,6 +367,7 @@ function parseSearchResult(value: unknown): ApiSearchResult {
       return { url: String(item.url ?? ""), alt: String(item.alt ?? "") }
     }) : [],
     vectorScore: numberOrUndefined(obj.vectorScore) ?? null,
+    sources: Array.isArray(obj.sources) ? obj.sources.filter((s): s is string => typeof s === "string") : undefined,
   }
 }
 

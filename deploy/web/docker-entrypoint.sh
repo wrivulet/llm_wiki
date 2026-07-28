@@ -20,6 +20,17 @@ if [ "${LLM_WIKI_MCP_ENABLE:-0}" = "1" ]; then
         LLM_WIKI_MCP_TOKEN="$(cat /run/secrets/llm_wiki_mcp_token)"
         export LLM_WIKI_MCP_TOKEN
     fi
+    # LLM_WIKI_API_TOKEN authenticates the *internal* hop from the MCP
+    # sidecar to the main binary's own REST API (api_server.rs, loopback
+    # :19828 — never published). Both processes read this exact env var
+    # name, so exporting it once here (before either is spawned) is all
+    # that's needed to make api_server.rs's own auth check pass for our
+    # sidecar's requests. Distinct from LLM_WIKI_MCP_TOKEN above, which
+    # authenticates the *external* hop from LibreChat to this sidecar.
+    if [ -z "${LLM_WIKI_API_TOKEN:-}" ] && [ -f /run/secrets/llm_wiki_api_token ]; then
+        LLM_WIKI_API_TOKEN="$(cat /run/secrets/llm_wiki_api_token)"
+        export LLM_WIKI_API_TOKEN
+    fi
     echo "[entrypoint] starting MCP HTTP sidecar" >&2
     node /app/mcp-server/dist/src/http.js &
 fi

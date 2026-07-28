@@ -132,13 +132,23 @@ oauth2-proxy;`mcp-server/src/http.ts` 自己校验令牌,自带 TLS(复用同一
 # 1. 建令牌 secret(LibreChat 侧原样使用这个值)
 openssl rand -hex 32 | docker secret create llm_wiki_mcp_token -
 
-# 2. docker-stack.yml 里给 llm-wiki 服务:
+# 2. 再建一个内部令牌:mcp-server 要转调本机 api_server.rs(:19828,只回环
+#    可达、从不对外发布)才能真正执行工具,而那个 API 默认要求鉴权。
+#    这个值只在容器内部使用,LibreChat 不需要知道它。
+openssl rand -hex 32 | docker secret create llm_wiki_api_token -
+
+# 3. docker-stack.yml 里给 llm-wiki 服务:
 #    - 取消 `ports: - "7189:3939"` 的注释
 #    - LLM_WIKI_MCP_ENABLE 改成 "1"
-#    (TLS 证书/密钥、llm_wiki_mcp_token secret 的挂载已经写好,不用再改)
+#    (TLS 证书/密钥、两个 secret 的挂载已经写好,不用再改)
 
 docker stack deploy -c deploy/web/docker-stack.yml llm-wiki
 ```
+
+漏配 `llm_wiki_api_token` 的典型症状:LibreChat 能成功连上并列出工具
+(`tools/list` 正常),但实际调用 `llm_wiki_chat` 等工具时报
+`LLM Wiki API 401: Unauthorized`——说明请求已经到达 mcp-server,只是它
+自己回环调用 api_server.rs 时没带对上的令牌。
 
 LibreChat 侧(`librechat.yaml`):
 

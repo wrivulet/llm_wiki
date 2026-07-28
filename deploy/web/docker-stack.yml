@@ -15,6 +15,9 @@
 #        docker secret create llm_wiki_tls_key privkey.pem
 #      如需给 LibreChat 开远程 MCP(见下方 llm-wiki 的 LLM_WIKI_MCP_* 环境变量):
 #        openssl rand -hex 32 | docker secret create llm_wiki_mcp_token -
+#      MCP 侧 tool 调用需要回环访问本机的 api_server.rs(:19828,从不对外
+#      发布),该 API 默认要求鉴权,和上面的 MCP 令牌是两码事,必须单独建:
+#        openssl rand -hex 32 | docker secret create llm_wiki_api_token -
 #   3. 按环境改 OIDC issuer / redirect / 镜像名后部署:
 #        LLM_WIKI_IMAGE=da2.example.internal:9350/llm-wiki-web:<version> \
 #        docker stack deploy -c deploy/web/docker-stack.yml llm-wiki
@@ -40,8 +43,8 @@ services:
       - /gfsdata/llm-wiki/data:/data
     # 远程 MCP(可选,给 LibreChat 用):默认不发布端口。启用时取消下方
     # `ports:` 注释,并把 environment 里的 LLM_WIKI_MCP_ENABLE 改成 "1":
-    # ports:
-    #   - "7189:3939"
+    ports:
+      - "7189:3939"
     configs:
       # 内部根 CA:/proxy 出站访问内网 LLM/搜索端点时的 TLS 信任锚
       - source: dbptest_root_ca
@@ -53,6 +56,10 @@ services:
       # 远程 MCP 用:LibreChat 侧 headers.Authorization 需填同一个值
       - source: llm_wiki_mcp_token
         target: /run/secrets/llm_wiki_mcp_token
+      # mcp-server 调用本机 api_server.rs(:19828)专用的内部令牌,
+      # 与上面对外的 llm_wiki_mcp_token 无关,LibreChat 不需要知道这个值
+      - source: llm_wiki_api_token
+        target: /run/secrets/llm_wiki_api_token
       - source: dbptest_tls_key
         target: /etc/ssl/dbp.test.example.internal.key
     environment:
@@ -65,7 +72,7 @@ services:
       # 远程 MCP(可选):默认关闭;开启前先取消上面 ports 的注释。
       # token 不直接写在这里——entrypoint 脚本会从下方 secrets 挂载的
       # /run/secrets/llm_wiki_mcp_token 读取并导出为 LLM_WIKI_MCP_TOKEN。
-      LLM_WIKI_MCP_ENABLE: "0"
+      LLM_WIKI_MCP_ENABLE: "1"
       LLM_WIKI_MCP_TLS_CERT: /etc/ssl/dbp.test.example.internal.crt
       LLM_WIKI_MCP_TLS_KEY: /etc/ssl/dbp.test.example.internal.key
     deploy:
@@ -96,7 +103,7 @@ services:
       - source: dbptest_tls_crt
         target: /etc/ssl/dbp.test.example.internal.crt
       # 允许登录的用户名单(一行一个 sub);改名单需升版 config 名再 deploy
-      - source: kb1_users
+      - source: llm_wiki_kb1_users
         target: /etc/oauth2/kb1-users.txt
     secrets:
       - source: llm_wiki_oidc_client_secret
@@ -156,9 +163,6 @@ networks:
       # 跨节点时加密业务流量(桥接本身是明文 HTTP)
       encrypted: "true"
 
-volumes:
-  llm-wiki-data:
-
 configs:
   dbptest_tls_crt:
     external: true
@@ -166,9 +170,9 @@ configs:
   dbptest_root_ca:
     external: true
   # 用户白名单,stack deploy 时由仓库文件自动创建;
-  # 改名单后把这里和 service 引用处同时升版(kb1_users_v2)再 deploy
-  kb1_users:
-    file: ./users/kb1.txt
+  # 改名单后把这里和 service 引用处同时升版(llm_wiki_kb1_users_v2)再 deploy
+  llm_wiki_kb1_users:
+    external: true
 
 secrets:
   llm_wiki_oidc_client_secret:
@@ -179,4 +183,7 @@ secrets:
     external: true
   # 远程 MCP 用共享令牌;LibreChat 侧原样填入 headers.Authorization
   llm_wiki_mcp_token:
+    external: true
+  # mcp-server → api_server.rs 内部回环调用专用令牌,不对外暴露
+  llm_wiki_api_token:
     external: true

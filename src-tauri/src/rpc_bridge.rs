@@ -210,6 +210,53 @@ struct CreateProjectArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct EmbeddingBatchArgs {
+    texts: Vec<String>,
+    cfg: SearchEmbeddingConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileRefArgs {
+    project_path: String,
+    file_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectionEditArgs {
+    project_path: String,
+    file_path: String,
+    prefix: String,
+    selected_text: String,
+    suffix: String,
+    replacement: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateMissingWikiPageArgs {
+    project_path: String,
+    title: String,
+    content: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportProjectArchiveArgs {
+    project_path: String,
+    destination: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportProjectArchiveArgs {
+    archive_path: String,
+    destination: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WatcherArgs {
     project_id: String,
     project_path: String,
@@ -492,6 +539,56 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Disp
         "embedding_fetch" => {
             let a: EmbeddingFetchArgs = parse(args)?;
             done(search::embedding_fetch(a.text, a.cfg, a.max_retries).await)
+        }
+        "embedding_fetch_batch" => {
+            let a: EmbeddingBatchArgs = parse(args)?;
+            done(search::embedding_fetch_batch(a.texts, a.cfg).await)
+        }
+        "get_page_links" => {
+            let a: FileRefArgs = parse(args)?;
+            done(search::get_page_links(a.project_path, a.file_path).await)
+        }
+        "apply_text_selection_edit" => {
+            let a: SelectionEditArgs = parse(args)?;
+            done(
+                cfs::apply_text_selection_edit(
+                    a.project_path,
+                    a.file_path,
+                    a.prefix,
+                    a.selected_text,
+                    a.suffix,
+                    a.replacement,
+                )
+                .await,
+            )
+        }
+        "create_missing_wiki_page" => {
+            let a: CreateMissingWikiPageArgs = parse(args)?;
+            done(cfs::create_missing_wiki_page(a.project_path, a.title, a.content).await)
+        }
+        "rebuild_wiki_index" => {
+            let a: ProjectPathArgs = parse(args)?;
+            done(commands::project_maintenance::rebuild_wiki_index(a.project_path).await)
+        }
+        "export_project_archive" => {
+            let a: ExportProjectArchiveArgs = parse(args)?;
+            done(
+                commands::project_maintenance::export_project_archive(
+                    a.project_path,
+                    a.destination,
+                )
+                .await,
+            )
+        }
+        "import_project_archive" => {
+            let a: ImportProjectArchiveArgs = parse(args)?;
+            done(
+                commands::project_maintenance::import_project_archive(
+                    a.archive_path,
+                    a.destination,
+                )
+                .await,
+            )
         }
         "web_search" => {
             let a: WebSearchArgs = parse(args)?;

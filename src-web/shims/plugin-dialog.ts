@@ -29,6 +29,12 @@ export interface OpenDialogOptions {
   defaultPath?: string
 }
 
+export interface SaveDialogOptions {
+  title?: string
+  filters?: DialogFilter[]
+  defaultPath?: string
+}
+
 export interface MessageDialogOptions {
   title?: string
   kind?: "info" | "warning" | "error"
@@ -189,6 +195,26 @@ export async function open(
 ): Promise<string | string[] | null> {
   if (options.directory) return openDirectoryFlow(options)
   return pickAndUpload(options)
+}
+
+/**
+ * Desktop's save() picks a path on the USER'S machine and the app then
+ * writes there directly. In the web build, commands like
+ * export_project_archive run server-side, so "save" can only mean "at
+ * this path on the server" — ask for one the same way the directory
+ * flow's server-path branch does. The resulting file stays server-side;
+ * callers that want it in the browser's Downloads must separately open
+ * `/asset?path=<destination>` to trigger a download.
+ */
+export async function save(options: SaveDialogOptions = {}): Promise<string | null> {
+  const hint = options.filters?.length
+    ? `(${options.filters.map((f) => f.extensions.join("/")).join(", ")})`
+    : ""
+  const value = window.prompt(
+    `${options.title ?? "选择保存位置"}${hint}\n请输入服务器上的绝对保存路径:`,
+    options.defaultPath ?? "/data/",
+  )
+  return value ? value : null
 }
 
 export async function message(

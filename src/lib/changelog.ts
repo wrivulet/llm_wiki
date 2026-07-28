@@ -26,6 +26,80 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.6.6",
+    date: "2026-07-27",
+    highlights: {
+      en: [
+        "Added Bocha Web Search as an external search provider for Agent, Deep Research, API, and MCP workflows.",
+        "Added targeted recovery for truncated Ingest output so missing Wiki files can be regenerated automatically.",
+        "Improved cross-platform PDF preview support.",
+        "Improved Windows scheduled imports, nested paths, drive-letter and UNC path handling, Clip Server recovery, and overall stability.",
+      ],
+      zh: [
+        "新增博查网页搜索 Provider，可用于 Agent、Deep Research、API 和 MCP 工作流。",
+        "新增 Ingest 截断定向恢复，可自动重新生成缺失的 Wiki 文件。",
+        "完善 PDF 跨平台预览支持。",
+        "优化 Windows 计划导入、嵌套目录、盘符和 UNC 路径处理，并改进 Clip Server 恢复与整体稳定性。",
+      ],
+    },
+  },
+  {
+    version: "0.6.5",
+    date: "2026-07-20",
+    highlights: {
+      en: [
+        "Added project-specific model configuration, including separate model routing for Chat and Ingest tasks.",
+        "Added multiple custom LLM providers, custom request headers, and a configurable streaming output option.",
+        "Added batch URL import and native Org mode source ingestion.",
+        "Added a Read Sources Only answer mode that grounds responses exclusively in original source material.",
+        "Improved embedding indexing performance and wiki-link repair for large projects.",
+        "Bound MCP sessions to their projects to prevent context from leaking between projects.",
+        "Added secure LAN support and customizable keyboard shortcuts to the Chrome Clipper.",
+        "Made Chat retrieval modes and Agent depth modes more compact and easier to switch.",
+        "Improved existing features and fixed stability, compatibility, and error-handling issues.",
+      ],
+      zh: [
+        "新增项目级模型配置，并支持 Chat、Ingest 等任务使用不同模型。",
+        "支持创建和切换多个自定义 LLM Provider，并新增自定义请求头和流式输出开关。",
+        "新增批量 URL 导入与 Org mode 文件摄取。",
+        "新增“只读原文”回答模式，仅依据原始资料提供答案。",
+        "优化 Embedding 索引速度和大项目 Wiki 链接修复性能。",
+        "MCP 会话与具体项目绑定，避免跨项目上下文混用。",
+        "Chrome 剪藏支持安全 LAN 连接与可自定义快捷键。",
+        "Chat 检索模式和 Agent 深度模式改为更紧凑的选择方式。",
+        "优化现有功能，并修复稳定性、兼容性和错误处理问题。",
+      ],
+    },
+  },
+  {
+    version: "0.6.4",
+    date: "2026-07-16",
+    highlights: {
+      en: [
+        "Added EPUB and MOBI source support so ebooks can be imported, previewed, and ingested into a project.",
+        "Added support for the official local MinerU API, including configurable service endpoints and Pipeline mode.",
+        "Added ZIP-based project export and import for migrating wiki content, source files, and project state.",
+        "Added deterministic wiki index rebuilding from the pages currently stored in the project.",
+        "Added configurable LLM request timeouts for long-running cloud models and local services.",
+        "Expanded Firecrawl configuration with API key authentication and custom service URLs.",
+        "Added a persistent collapsible knowledge sidebar that preserves more space for the active workspace.",
+        "Added Czech as an AI output language option.",
+        "Improved existing features and fixed bugs across document import, frontmatter handling, source links, knowledge graphs, missing-page checks, and cross-platform compatibility.",
+      ],
+      zh: [
+        "新增 EPUB 和 MOBI 原始资料支持，电子书可直接导入、预览并摄取到项目中。",
+        "新增官方 Local MinerU API 支持，可配置服务地址并使用 Pipeline 模式。",
+        "新增 ZIP 项目导出与导入功能，可迁移 Wiki 内容、原始资料和项目状态。",
+        "新增 Wiki 索引重建功能，可根据项目中现有页面确定性生成索引。",
+        "新增 LLM 请求超时时间设置，适配耗时较长的云端模型和本地服务。",
+        "扩展 Firecrawl 配置，支持 API Key 鉴权和自定义服务地址。",
+        "新增可持久保存状态的知识库侧栏折叠功能，为当前工作区释放更多空间。",
+        "新增捷克语 AI 输出语言选项。",
+        "优化现有功能并修复文档导入、Frontmatter、来源链接、知识图谱、缺失页面检查和跨平台兼容等问题。",
+      ],
+    },
+  },
+  {
     version: "0.6.1",
     date: "2026-07-10",
     highlights: {

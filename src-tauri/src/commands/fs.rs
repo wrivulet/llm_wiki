@@ -20,7 +20,8 @@ const MEDIA_EXTS: &[&str] = &[
     "mp4", "webm", "mov", "avi", "mkv", "flv", "wmv", "m4v", "mp3", "wav", "ogg", "flac", "aac",
     "m4a", "wma",
 ];
-const LEGACY_DOC_EXTS: &[&str] = &["ppt", "pages", "numbers", "key", "epub"];
+const EBOOK_EXTS: &[&str] = &["epub", "mobi"];
+const LEGACY_DOC_EXTS: &[&str] = &["ppt", "pages", "numbers", "key"];
 
 fn require_absolute_path(operation: &str, path: &str) -> Result<(), String> {
     if is_absolute_path_cross_platform(path) {
@@ -81,7 +82,9 @@ pub async fn read_file(path: String, extract_images: Option<bool>) -> Result<Str
 
             match ext.as_str() {
                 "pdf" => extract_pdf_text(&path, include_images),
+                "org" => extract_org_text(&path),
                 e if OFFICE_EXTS.contains(&e) => extract_office_text(&path, e),
+                e if EBOOK_EXTS.contains(&e) => crate::commands::ebook::extract_ebook_text(&path, e),
                 e if IMAGE_EXTS.contains(&e) => {
                     let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     Ok(format!("[Image: {} ({:.1} KB)]", p.file_name().unwrap_or_default().to_string_lossy(), size as f64 / 1024.0))
@@ -132,7 +135,11 @@ pub async fn preprocess_file(path: String) -> Result<String, String> {
 
             let text = match ext.as_str() {
                 "pdf" => extract_pdf_text(&path, false)?,
+                "org" => extract_org_text(&path)?,
                 e if OFFICE_EXTS.contains(&e) => extract_office_text(&path, e)?,
+                e if EBOOK_EXTS.contains(&e) => {
+                    crate::commands::ebook::extract_ebook_text(&path, e)?
+                }
                 _ => return Ok("no preprocessing needed".to_string()),
             };
 
@@ -162,6 +169,16 @@ fn read_cache(original: &Path) -> Option<String> {
     }
 }
 
+/// Return a fresh preprocessing cache for Agent source retrieval.
+///
+/// Binary imports remain the referenced source of record; this helper only
+/// exposes their text extraction and never causes parsing or cache writes from
+/// a search request. Keeping freshness checks here also prevents the Agent
+/// from quoting a cache after the original file changed externally.
+pub(crate) fn read_preprocessed_cache(original: &Path) -> Option<String> {
+    read_cache(original)
+}
+
 fn write_cache(original: &Path, text: &str) -> Result<(), String> {
     let cache_path = cache_path_for(original);
     if let Some(parent) = cache_path.parent() {
@@ -169,6 +186,135 @@ fn write_cache(original: &Path, text: &str) -> Result<(), String> {
     }
     crate::commands::file_sync::mark_app_write_path(&cache_path);
     fs::write(&cache_path, text).map_err(|e| format!("Failed to write cache: {}", e))
+}
+
+/// Convert common Org syntax into Markdown-shaped text for ingestion and
+/// preview. The original `.org` file remains untouched in `raw/sources`.
+/// Source blocks are copied verbatim inside fences and are never executed.
+fn extract_org_text(path: &str) -> Result<String, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read Org file '{}': {}", path, e))?;
+    Ok(org_to_markdown(&content))
+}
+
+fn org_to_markdown(content: &str) -> String {
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    let mut output = Vec::new();
+    let mut block_end: Option<&'static str> = None;
+
+    for line in normalized.lines() {
+        let trimmed = line.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if let Some(end) = block_end {
+            if upper == end {
+                output.push("```".to_string());
+                block_end = None;
+            } else {
+                output.push(line.to_string());
+            }
+            continue;
+        }
+
+        if upper.starts_with("#+BEGIN_SRC") {
+            let language = trimmed[11..].trim().split_whitespace().next().unwrap_or("");
+            output.push(format!("```{language}"));
+            block_end = Some("#+END_SRC");
+            continue;
+        }
+        if upper == "#+BEGIN_EXAMPLE" {
+            output.push("```text".to_string());
+            block_end = Some("#+END_EXAMPLE");
+            continue;
+        }
+        if upper == "#+BEGIN_QUOTE" {
+            output.push("```text".to_string());
+            block_end = Some("#+END_QUOTE");
+            continue;
+        }
+
+        if let Some((key, value)) = parse_org_keyword(trimmed) {
+            if key == "TITLE" {
+                output.push(format!("# {value}"));
+            } else if !matches!(key.as_str(), "OPTIONS" | "PROPERTY" | "SETUPFILE") {
+                output.push(format!("**{}:** {}", title_case_ascii(&key), value));
+            }
+            continue;
+        }
+
+        if let Some((level, heading)) = parse_org_heading(line) {
+            output.push(format!(
+                "{} {}",
+                "#".repeat(level.min(6)),
+                convert_org_links(heading)
+            ));
+            continue;
+        }
+
+        if trimmed.starts_with('|')
+            && trimmed.ends_with('|')
+            && trimmed.contains('+')
+            && trimmed
+                .chars()
+                .all(|c| matches!(c, '|' | '+' | '-' | ':' | ' '))
+        {
+            output.push(trimmed.replace('+', "|"));
+            continue;
+        }
+
+        output.push(convert_org_links(line));
+    }
+    if block_end.is_some() {
+        output.push("```".to_string());
+    }
+    output.join("\n")
+}
+
+fn parse_org_keyword(line: &str) -> Option<(String, &str)> {
+    let rest = line.strip_prefix("#+")?;
+    let (key, value) = rest.split_once(':')?;
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some((key.to_ascii_uppercase(), value.trim()))
+}
+
+fn parse_org_heading(line: &str) -> Option<(usize, &str)> {
+    let stars = line.chars().take_while(|c| *c == '*').count();
+    if stars == 0 || line.as_bytes().get(stars) != Some(&b' ') {
+        return None;
+    }
+    Some((stars, line[stars + 1..].trim()))
+}
+
+fn title_case_ascii(value: &str) -> String {
+    let lower = value.replace('_', " ").to_ascii_lowercase();
+    let mut chars = lower.chars();
+    chars
+        .next()
+        .map(|c| c.to_ascii_uppercase().to_string() + chars.as_str())
+        .unwrap_or_default()
+}
+
+fn convert_org_links(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find("[[") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("]]") else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let inner = &after[..end];
+        if let Some((target, description)) = inner.split_once("][") {
+            out.push_str(&format!("[{}]({})", description, target));
+        } else {
+            out.push_str(&format!("<{}>", inner));
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Global PDFium instance — the library prefers a single binding shared
@@ -1072,6 +1218,215 @@ pub async fn write_file_atomic(path: String, contents: String) -> Result<(), Str
     .map_err(|e| format!("write_file_atomic blocking task join error: {e}"))?
 }
 
+fn apply_text_selection_edit_inner(
+    project_path: &str,
+    file_path: &str,
+    prefix: &str,
+    selected_text: &str,
+    suffix: &str,
+    replacement: &str,
+) -> Result<String, String> {
+    let project = fs::canonicalize(project_path)
+        .map_err(|err| format!("Failed to resolve project path: {err}"))?;
+    let file = fs::canonicalize(file_path)
+        .map_err(|err| format!("Failed to resolve selected file: {err}"))?;
+    if !file.starts_with(&project) || !file.is_file() {
+        return Err(
+            "Selection edit target must be an existing file inside the project".to_string(),
+        );
+    }
+    let current = fs::read_to_string(&file)
+        .map_err(|err| format!("Failed to read selection edit target: {err}"))?;
+    let expected = format!("{prefix}{selected_text}{suffix}");
+    if current != expected {
+        return Err(
+            "The file changed after the selection was captured. Re-select the text before applying the Agent suggestion."
+                .to_string(),
+        );
+    }
+    let updated = format!("{prefix}{replacement}{suffix}");
+    file_sync::mark_app_write_path(&file);
+    crate::commands::file_history::record_file_version(
+        &file,
+        "baseline",
+        "before.agent.selection_edit",
+    );
+    fs::write(&file, &updated)
+        .map_err(|err| format!("Failed to apply Agent selection edit: {err}"))?;
+    crate::commands::file_history::record_file_version(&file, "agent", "agent.selection_edit");
+    file_sync::mark_app_write_path(&file);
+    Ok(updated)
+}
+
+/// Apply one Agent-proposed replacement without overwriting intervening user
+/// edits. The full prefix/selection/suffix snapshot is intentionally checked at
+/// the Rust write boundary; a frontend-only check would leave a TOCTOU window.
+#[tauri::command]
+pub async fn apply_text_selection_edit(
+    project_path: String,
+    file_path: String,
+    prefix: String,
+    selected_text: String,
+    suffix: String,
+    replacement: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_guarded("apply_text_selection_edit", || {
+            apply_text_selection_edit_inner(
+                &project_path,
+                &file_path,
+                &prefix,
+                &selected_text,
+                &suffix,
+                &replacement,
+            )
+        })
+    })
+    .await
+    .map_err(|err| format!("apply_text_selection_edit blocking task join error: {err}"))?
+}
+
+fn create_missing_wiki_page_inner(
+    project_path: &str,
+    title: &str,
+    content: Option<&str>,
+) -> Result<String, String> {
+    let project = fs::canonicalize(project_path)
+        .map_err(|err| format!("Failed to resolve project path: {err}"))?;
+    let title = title.trim();
+    if title.is_empty() || title.chars().count() > 200 {
+        return Err("Missing-link page title must contain 1 to 200 characters".to_string());
+    }
+    let normalized_title = title
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let title = normalized_title.trim();
+    if content.is_some_and(|value| value.len() > 2 * 1024 * 1024) {
+        return Err("Missing-link page content exceeds the 2 MB limit".to_string());
+    }
+    let wiki_root = project.join("wiki");
+    let canonical_wiki = fs::canonicalize(&wiki_root)
+        .map_err(|err| format!("Failed to resolve wiki directory: {err}"))?;
+    if !canonical_wiki.starts_with(&project) {
+        return Err("Wiki directory escapes the project boundary".to_string());
+    }
+    let directory = canonical_wiki.join("concepts");
+    fs::create_dir_all(&directory)
+        .map_err(|err| format!("Failed to create wiki concepts directory: {err}"))?;
+    let canonical_directory = fs::canonicalize(&directory)
+        .map_err(|err| format!("Failed to resolve wiki concepts directory: {err}"))?;
+    if !canonical_directory.starts_with(&project) {
+        return Err("Wiki concepts directory escapes the project boundary".to_string());
+    }
+    let base = safe_missing_page_stem(title);
+    let mut target = canonical_directory.join(format!("{base}.md"));
+    for suffix in 2..=9999 {
+        if !target.exists() {
+            break;
+        }
+        target = canonical_directory.join(format!("{base}-{suffix}.md"));
+    }
+    if target.exists() {
+        return Err("Could not allocate a unique wiki page filename".to_string());
+    }
+    let today = chrono::Utc::now().format("%Y-%m-%d");
+    let escaped_title = title.replace('"', "\\\"");
+    let default_content = format!(
+        "---\ntype: concept\ntitle: \"{escaped_title}\"\ncreated: {today}\nupdated: {today}\ntags: []\nrelated: []\n---\n\n# {title}\n"
+    );
+    let body = content
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&default_content);
+    file_sync::mark_app_write_path(&target);
+    use std::io::Write as _;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
+        .map_err(|err| format!("Failed to reserve missing-link page: {err}"))?;
+    if let Err(err) = output.write_all(body.as_bytes()) {
+        drop(output);
+        let _ = fs::remove_file(&target);
+        return Err(format!("Failed to create missing-link page: {err}"));
+    }
+    crate::commands::file_history::record_file_version(
+        &target,
+        "agent",
+        "wiki.missing_link.create",
+    );
+    file_sync::mark_app_write_path(&target);
+    target
+        .strip_prefix(&project)
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .map_err(|_| "Created page escaped the project boundary".to_string())
+}
+
+fn safe_missing_page_stem(title: &str) -> String {
+    let mut stem = title
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+            {
+                '-'
+            } else if character.is_whitespace() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    while stem.contains("--") {
+        stem = stem.replace("--", "-");
+    }
+    stem = stem.trim_matches([' ', '.', '-']).to_string();
+    if stem.is_empty() {
+        stem = "untitled".to_string();
+    }
+    let device = stem
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (device.len() == 4
+            && (device.starts_with("COM") || device.starts_with("LPT"))
+            && device.as_bytes()[3].is_ascii_digit()
+            && device.as_bytes()[3] != b'0')
+    {
+        stem = format!("page-{stem}");
+    }
+    stem.chars().take(120).collect()
+}
+
+/// Create a page for an unresolved wikilink. Filename allocation and the final
+/// write stay in Rust so UI callers cannot escape the project or overwrite an
+/// existing page, including through Windows device names or illegal characters.
+#[tauri::command]
+pub async fn create_missing_wiki_page(
+    project_path: String,
+    title: String,
+    content: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_guarded("create_missing_wiki_page", || {
+            create_missing_wiki_page_inner(&project_path, &title, content.as_deref())
+        })
+    })
+    .await
+    .map_err(|err| format!("create_missing_wiki_page blocking task join error: {err}"))?
+}
+
 /// Whether a directory entry should appear in a listing.
 ///
 /// Hidden (dot-prefixed) entries are shown only when `include_hidden`
@@ -1506,6 +1861,7 @@ pub async fn read_file_as_base64(path: String) -> Result<FileBase64, String> {
                 "bmp" => "image/bmp",
                 "tiff" | "tif" => "image/tiff",
                 "svg" => "image/svg+xml",
+                "pdf" => "application/pdf",
                 _ => "application/octet-stream",
             }
             .to_string();
@@ -1600,6 +1956,29 @@ pub async fn get_file_md5(path: String) -> Result<String, String> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn org_to_markdown_preserves_common_elements_without_executing_source_blocks() {
+        let input = "#+TITLE: Research Notes\r\n#+AUTHOR: Ada\r\n* TODO Topic :rust:notes:\r\nParagraph with [[https://example.com][reference]] and [[file:local.pdf]].\r\n- [ ] Verify\r\n| Name | Value |\r\n|------+-------|\r\n| A    | 1     |\r\n#+BEGIN_SRC sh\r\necho never-run\r\n#+END_SRC\r\n";
+        let output = org_to_markdown(input);
+        assert!(output.contains("# Research Notes"));
+        assert!(output.contains("**Author:** Ada"));
+        assert!(output.contains("# TODO Topic :rust:notes:"));
+        assert!(output.contains("[reference](https://example.com)"));
+        assert!(output.contains("<file:local.pdf>"));
+        assert!(output.contains("|------|-------|"));
+        assert!(output.contains("```sh\necho never-run\n```"));
+    }
+
+    #[test]
+    fn org_to_markdown_closes_unterminated_source_block_and_keeps_unknown_lines() {
+        let output = org_to_markdown(
+            "#+OPTIONS: toc:nil\n#+CUSTOM: kept\n* Heading\n#+BEGIN_SRC python\nprint('text only')",
+        );
+        assert!(!output.contains("OPTIONS"));
+        assert!(output.contains("**Custom:** kept"));
+        assert!(output.ends_with("```"));
+    }
 
     /// Write `bytes` to a fresh tmp path with `.pdf` suffix and return
     /// the path (the OS tmpdir is NOT cleaned up — acceptable for tests).
@@ -1838,13 +2217,7 @@ mod tests {
     // would be surfaced here and then wrongly deleted downstream.
 
     fn make_wiki(files: &[(&str, &str)]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "wiki-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = std::env::temp_dir().join(format!("wiki-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         for (rel, body) in files {
             let p = dir.join(rel);
@@ -2043,13 +2416,8 @@ mod tests {
     // folder import button.
 
     fn make_temp_dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "llmwiki-copydir-{label}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("llmwiki-copydir-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -2270,5 +2638,120 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn selection_edit_rejects_stale_content_and_preserves_user_changes() {
+        let root = make_temp_dir("selection-edit");
+        let file = root.join("wiki/page.md");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "before selected after").unwrap();
+
+        let updated = apply_text_selection_edit_inner(
+            root.to_str().unwrap(),
+            file.to_str().unwrap(),
+            "before ",
+            "selected",
+            " after",
+            "replacement",
+        )
+        .unwrap();
+        assert_eq!(updated, "before replacement after");
+
+        std::fs::write(&file, "user changed the file").unwrap();
+        let error = apply_text_selection_edit_inner(
+            root.to_str().unwrap(),
+            file.to_str().unwrap(),
+            "before ",
+            "selected",
+            " after",
+            "second replacement",
+        )
+        .unwrap_err();
+        assert!(error.contains("changed after the selection"));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "user changed the file"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_link_page_uses_safe_unique_cross_platform_names() {
+        let root = make_temp_dir("missing-link-page");
+        std::fs::create_dir_all(root.join("wiki")).unwrap();
+        let first =
+            create_missing_wiki_page_inner(root.to_str().unwrap(), "AUX: Safety / Notes?", None)
+                .unwrap();
+        let second = create_missing_wiki_page_inner(
+            root.to_str().unwrap(),
+            "AUX: Safety / Notes?",
+            Some("# Draft"),
+        )
+        .unwrap();
+        assert_eq!(first, "wiki/concepts/AUX- Safety - Notes.md");
+        assert_eq!(second, "wiki/concepts/AUX- Safety - Notes-2.md");
+        assert_eq!(
+            std::fs::read_to_string(root.join(second)).unwrap(),
+            "# Draft"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_link_page_handles_reserved_cjk_and_traversal_titles_without_overwrite() {
+        let root = make_temp_dir("missing-link-adversarial");
+        std::fs::create_dir_all(root.join("wiki/concepts")).unwrap();
+        std::fs::write(root.join("wiki/concepts/Existing Page.md"), "user content").unwrap();
+
+        let reserved = create_missing_wiki_page_inner(root.to_str().unwrap(), "AUX", None).unwrap();
+        let cjk =
+            create_missing_wiki_page_inner(root.to_str().unwrap(), "知识 图谱", None).unwrap();
+        let traversal =
+            create_missing_wiki_page_inner(root.to_str().unwrap(), "../../escape", None).unwrap();
+        let allocated =
+            create_missing_wiki_page_inner(root.to_str().unwrap(), "Existing Page", None).unwrap();
+
+        assert_eq!(reserved, "wiki/concepts/page-AUX.md");
+        assert_eq!(cjk, "wiki/concepts/知识 图谱.md");
+        assert_eq!(traversal, "wiki/concepts/escape.md");
+        assert_eq!(allocated, "wiki/concepts/Existing Page-2.md");
+        assert_eq!(
+            std::fs::read_to_string(root.join("wiki/concepts/Existing Page.md")).unwrap(),
+            "user content"
+        );
+        assert!(!root.parent().unwrap().join("escape.md").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_link_page_rejects_content_over_two_megabytes() {
+        let root = make_temp_dir("missing-link-size");
+        std::fs::create_dir_all(root.join("wiki")).unwrap();
+        let content = "x".repeat(2 * 1024 * 1024 + 1);
+        let error = create_missing_wiki_page_inner(root.to_str().unwrap(), "large", Some(&content))
+            .unwrap_err();
+        assert!(error.contains("2 MB"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selection_edit_rejects_files_outside_project() {
+        let root = make_temp_dir("selection-boundary");
+        let outside = make_temp_dir("selection-outside").join("outside.md");
+        std::fs::write(&outside, "selected").unwrap();
+        let error = apply_text_selection_edit_inner(
+            root.to_str().unwrap(),
+            outside.to_str().unwrap(),
+            "",
+            "selected",
+            "",
+            "replacement",
+        )
+        .unwrap_err();
+        assert!(error.contains("inside the project"));
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "selected");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside.parent().unwrap());
     }
 }

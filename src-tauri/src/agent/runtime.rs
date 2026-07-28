@@ -22,8 +22,9 @@ use super::router::route_query;
 use super::skills::{load_project_skills, AgentSkill};
 use super::tools::{self, AnyTxtConfig, ToolRegistry, WebSearchConfig};
 use super::types::{
-    AgentChatRequest, AgentChatResponse, AgentMode, AgentReference, AgentSkillMode, AgentToolEvent,
-    AgentUsage, AgentUserInputField, AgentUserInputOption, AgentUserInputRequest,
+    AgentChatRequest, AgentChatResponse, AgentMode, AgentReference, AgentRetrievalMode,
+    AgentSkillMode, AgentToolEvent, AgentUsage, AgentUserInputField, AgentUserInputOption,
+    AgentUserInputRequest,
 };
 use super::workspace::{agent_workspace_display, AGENT_WORKSPACE_DIR};
 
@@ -221,7 +222,7 @@ impl AgentRuntime {
             );
         }
 
-        if request.tools.web {
+        if request.tools.web && request.retrieval_mode != AgentRetrievalMode::Faithful {
             permission_policy.require(AgentCapability::SearchWeb)?;
             tool_emit_event(&mut tool_events, &mut events, &event_sink, AgentToolEvent {
                 tool: "web.search".to_string(),
@@ -229,7 +230,7 @@ impl AgentRuntime {
                 detail: Some("Web search is enabled for this turn. Router decides whether to execute it immediately.".to_string()),
             });
         }
-        if request.tools.anytxt {
+        if request.tools.anytxt && request.retrieval_mode != AgentRetrievalMode::Faithful {
             permission_policy.require(AgentCapability::SearchAnyTxt)?;
             tool_emit_event(&mut tool_events, &mut events, &event_sink, AgentToolEvent {
                 tool: "anytxt.search".to_string(),
@@ -1151,7 +1152,10 @@ impl AgentRuntime {
             }
         }
         let retrieval_summary = retrieval_parts.join("\n\n");
-        let project_context = load_project_context(&self.project_path);
+        let project_context = project_context_for_retrieval_mode(
+            load_project_context(&self.project_path),
+            request.retrieval_mode,
+        );
         let explicit_files =
             load_explicit_context_files(&self.project_path, &request.context_files).await;
         let built_context = fit_context_to_model(
@@ -1309,7 +1313,10 @@ impl AgentRuntime {
             .ok_or_else(|| "Backend Agent LLM is not configured".to_string())?;
         let client = LlmClient::new(config.clone())?
             .structured_task_config(agent_structured_max_tokens(!skills.is_empty()));
-        let project_context = load_project_context(&self.project_path);
+        let project_context = project_context_for_retrieval_mode(
+            load_project_context(&self.project_path),
+            request.retrieval_mode,
+        );
         let explicit_files =
             load_explicit_context_files(&self.project_path, &request.context_files).await;
         if !request.context_files.is_empty() {
@@ -1341,12 +1348,14 @@ impl AgentRuntime {
         let mut observations = Vec::<AgentObservation>::new();
         let mut executed_retrievals = BTreeSet::<String>::new();
         let mut retrieval_steps = 0usize;
+        let mut consecutive_no_gain_retrievals = 0usize;
         let mut force_final_next = false;
         let mut last_prompt_chars = 0usize;
         let has_explicit_skills =
             request.skill_mode == AgentSkillMode::Explicit && !skills.is_empty();
         let max_iterations = agent_loop_iteration_budget(request.mode, has_explicit_skills);
-        let retrieval_budget = agent_loop_retrieval_budget(request.mode, has_explicit_skills);
+        let retrieval_budget =
+            agent_loop_retrieval_budget(request.mode, request.retrieval_mode, has_explicit_skills);
 
         if let Some(command) = request
             .shell_command
@@ -1384,6 +1393,37 @@ impl AgentRuntime {
             }
         }
 
+        if request.retrieval_mode == AgentRetrievalMode::Faithful && request.tools.wiki {
+            let source_action = AgentLoopAction {
+                action: "tool".to_string(),
+                tool: Some("source.search".to_string()),
+                query: Some(message.to_string()),
+                ..AgentLoopAction::default()
+            };
+            let input = self.agent_loop_tool_input(request, "source.search", &source_action)?;
+            executed_retrievals.insert(retrieval_signature(
+                "source.search",
+                &input,
+                request.retrieval_mode,
+            ));
+            retrieval_steps += 1;
+            let observation = self
+                .execute_agent_loop_tool(
+                    request,
+                    &source_action,
+                    &permission_policy,
+                    &tool_registry,
+                    &skills,
+                    &mut references,
+                    &mut tool_events,
+                    &mut events,
+                    &event_sink,
+                    cancellation,
+                )
+                .await?;
+            observations.push(observation);
+        }
+
         for iteration in 0..max_iterations {
             check_cancel(cancellation)?;
             let must_finalize = force_final_next || retrieval_steps >= retrieval_budget;
@@ -1407,12 +1447,12 @@ impl AgentRuntime {
             );
             let (system, user) = if must_finalize {
                 (
-                    build_agent_final_system(&built_context.system),
+                    build_agent_final_system(&built_context.system, request.retrieval_mode),
                     build_agent_final_user(&built_context.user, &observations),
                 )
             } else {
                 (
-                    build_agent_loop_system(&built_context.system),
+                    build_agent_loop_system(&built_context.system, request.retrieval_mode),
                     build_agent_loop_user(
                         &built_context.user,
                         request,
@@ -1682,10 +1722,12 @@ impl AgentRuntime {
                 });
             }
 
-            if action.tool.as_deref().is_some_and(is_agent_retrieval_tool) {
+            let retrieval_tool = action.tool.as_deref().is_some_and(is_agent_retrieval_tool);
+            let evidence_count_before = smart_evidence_count(&references);
+            if retrieval_tool {
                 let tool = action.tool.as_deref().unwrap_or_default();
                 if let Ok(input) = self.agent_loop_tool_input(request, tool, &action) {
-                    let signature = format!("{tool}:{}", canonical_json(&input));
+                    let signature = retrieval_signature(tool, &input, request.retrieval_mode);
                     if !executed_retrievals.insert(signature) {
                         observations.push(record_loop_tool_rejection(
                             tool,
@@ -1755,6 +1797,23 @@ impl AgentRuntime {
                 });
             }
             observations.push(observation);
+            if retrieval_tool && request.retrieval_mode == AgentRetrievalMode::Smart {
+                let evidence_count_after = smart_evidence_count(&references);
+                let latest = observations.last().expect("observation was just appended");
+                if retrieval_added_evidence(
+                    &latest.tool,
+                    &latest.summary,
+                    evidence_count_before,
+                    evidence_count_after,
+                ) {
+                    consecutive_no_gain_retrievals = 0;
+                } else {
+                    consecutive_no_gain_retrievals += 1;
+                    if consecutive_no_gain_retrievals >= 2 {
+                        force_final_next = true;
+                    }
+                }
+            }
         }
 
         let answer = agent_iteration_limit_answer(max_iterations, observations.len(), &references);
@@ -2721,6 +2780,21 @@ fn should_plan_tools_with_model(
     !message.trim().is_empty() && has_available_tool
 }
 
+fn project_context_for_retrieval_mode(
+    mut project: super::context::ProjectContext,
+    retrieval_mode: AgentRetrievalMode,
+) -> super::context::ProjectContext {
+    if retrieval_mode == AgentRetrievalMode::Faithful {
+        // Faithful-source mode must enforce its evidence boundary before prompt
+        // construction. overview.md is generated knowledge, and schema.md can
+        // contain domain descriptions; asking the model to ignore either would
+        // be a soft guarantee rather than source-only context isolation.
+        project.overview = None;
+        project.schema = None;
+    }
+    project
+}
+
 fn agent_loop_iteration_budget(mode: AgentMode, has_skills: bool) -> usize {
     let base = match mode {
         AgentMode::Fast => 4,
@@ -2737,7 +2811,25 @@ fn agent_loop_iteration_budget(mode: AgentMode, has_skills: bool) -> usize {
     }
 }
 
-fn agent_loop_retrieval_budget(mode: AgentMode, has_explicit_skills: bool) -> usize {
+fn agent_loop_retrieval_budget(
+    mode: AgentMode,
+    retrieval_mode: AgentRetrievalMode,
+    has_explicit_skills: bool,
+) -> usize {
+    if retrieval_mode == AgentRetrievalMode::Faithful {
+        return match mode {
+            AgentMode::Fast => 2,
+            AgentMode::Standard | AgentMode::LocalFirst => 3,
+            AgentMode::Deep => 5,
+        };
+    }
+    if retrieval_mode == AgentRetrievalMode::Smart {
+        return match mode {
+            AgentMode::Fast => 3,
+            AgentMode::Standard | AgentMode::LocalFirst => 4,
+            AgentMode::Deep => 6,
+        };
+    }
     let base = match mode {
         AgentMode::Fast => 2,
         AgentMode::Standard | AgentMode::LocalFirst => 4,
@@ -2766,6 +2858,52 @@ fn canonical_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
+fn retrieval_signature(tool: &str, input: &Value, mode: AgentRetrievalMode) -> String {
+    if mode == AgentRetrievalMode::Standard {
+        return format!("{tool}:{}", canonical_json(input));
+    }
+    let mut normalized = input.clone();
+    if let Some(query) = normalized.get_mut("query") {
+        if let Some(value) = query.as_str() {
+            let compact = value
+                .to_lowercase()
+                .split(|character: char| {
+                    character.is_whitespace() || character.is_ascii_punctuation()
+                })
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            *query = Value::String(compact);
+        }
+    }
+    format!("{tool}:{}", canonical_json(&normalized))
+}
+
+fn smart_evidence_count(references: &[AgentReference]) -> usize {
+    references
+        .iter()
+        .map(|reference| format!("{}:{}", reference.kind, reference.path))
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn retrieval_added_evidence(
+    tool: &str,
+    summary: &str,
+    reference_count_before: usize,
+    reference_count_after: usize,
+) -> bool {
+    if reference_count_after > reference_count_before {
+        return true;
+    }
+    if tool == "wiki.read_page" {
+        return summary
+            .split_once('\n')
+            .is_some_and(|(_, content)| !content.trim().is_empty());
+    }
+    false
+}
+
 fn should_fallback_wiki_search(
     planner_unavailable_or_failed: bool,
     tools: &super::types::AgentToolOptions,
@@ -2774,12 +2912,27 @@ fn should_fallback_wiki_search(
     planner_unavailable_or_failed && tools.wiki && skills_empty
 }
 
-fn build_agent_loop_system(base_system: &str) -> String {
+fn build_agent_loop_system(base_system: &str, retrieval_mode: AgentRetrievalMode) -> String {
+    let smart_retrieval = if retrieval_mode == AgentRetrievalMode::Smart {
+        "\nSmart retrieval is enabled. Treat retrieval as a bounded evidence loop: after every observation, identify only the unresolved evidence gap, then either issue one concise revised retrieval action or answer. Prefer reading/following already discovered pages before broadening the query. Do not repeat equivalent queries. Stop as soon as the available evidence supports a cited answer; optional background is not a reason to continue."
+    } else {
+        ""
+    };
+    let faithful_retrieval = if retrieval_mode == AgentRetrievalMode::Faithful {
+        "\nFaithful-source mode is enabled by explicit user choice. Answer only from raw source excerpts returned by source.search or explicitly attached source files. Preserve quoted wording exactly and cite the source path beside every quotation or factual claim. Clearly distinguish verbatim quotations from explanation. Generated wiki pages, graph context, web results, AnyTXT results, and unsupported background knowledge are not evidence in this mode. If the available excerpts are insufficient, state that limitation instead of reconstructing or guessing."
+    } else {
+        ""
+    };
+    let retrieval_example = if retrieval_mode == AgentRetrievalMode::Faithful {
+        "1. {\"action\":\"tool\",\"tool\":\"source.search\",\"query\":\"...\"}"
+    } else {
+        "1. {\"action\":\"tool\",\"tool\":\"wiki.search\",\"query\":\"...\"}"
+    };
     format!(
         "{base_system}\n\nAgent loop protocol:\n\
 Return only compact JSON. Do not wrap it in markdown.\n\
 Choose exactly one action per turn:\n\
-1. {{\"action\":\"tool\",\"tool\":\"wiki.search\",\"query\":\"...\"}}\n\
+{retrieval_example}\n\
 2. {{\"action\":\"tool\",\"tool\":\"user.ask\",\"title\":\"...\",\"description\":\"...\",\"fields\":[{{\"id\":\"choice\",\"type\":\"single\",\"label\":\"...\",\"options\":[{{\"label\":\"...\",\"value\":\"...\",\"recommended\":true}}]}}]}}\n\
 3. {{\"action\":\"tool\",\"tool\":\"workspace.write_file\",\"path\":\"cover-image/cover.svg\",\"content\":\"...\"}}\n\
 3b. {{\"action\":\"tool\",\"tool\":\"workspace.append_file\",\"path\":\"deck/index.html\",\"content\":\"...\"}}\n\
@@ -2793,13 +2946,18 @@ Use tools when they are useful, then wait for the observation in the next turn b
 	Do not claim that a generated file exists until a workspace.write_file or shell.exec observation confirms it. In the final answer, mention only observed generated file paths.\n\
 	Converge quickly. Do not keep reading optional references, running optional validation, or polishing after the requested deliverable has been written. Prefer final as soon as the core user request is satisfied.\n\
 	Only use shell.exec when active skill instructions or the user's explicit request require command-line work after files have been written with workspace.write_file. Generated files must be written under the Agent workspace described above. Commands whose explicit file paths stay inside the Agent workspace can run without an approval prompt; commands that mention external paths, home directories, downloads, temp folders, or network URLs require approval.\n\
-Use wiki.write_page only when the user explicitly asks to create or update a wiki page. Existing pages are create-only unless allowOverwrite is explicitly justified by the user's request."
+Use wiki.write_page only when the user explicitly asks to create or update a wiki page. Existing pages are create-only unless allowOverwrite is explicitly justified by the user's request.{smart_retrieval}{faithful_retrieval}"
     )
 }
 
-fn build_agent_final_system(base_system: &str) -> String {
+fn build_agent_final_system(base_system: &str, retrieval_mode: AgentRetrievalMode) -> String {
+    let faithful_retrieval = if retrieval_mode == AgentRetrievalMode::Faithful {
+        " Faithful-source mode remains in force: use only raw source excerpts or explicitly attached source files as evidence, cite their paths, preserve quotations exactly, and disclose insufficient evidence rather than guessing."
+    } else {
+        ""
+    };
     format!(
-        "{base_system}\n\nThe retrieval phase is complete. No tools are available now. Answer the user's latest request directly using the project context and tool observations already provided. Return only compact JSON in the form {{\"action\":\"final\",\"answer\":\"...\"}}. Do not request, announce, or simulate another search or file read."
+        "{base_system}\n\nThe retrieval phase is complete. No tools are available now. Answer the user's latest request directly using the permitted context and tool observations already provided.{faithful_retrieval} Return only compact JSON in the form {{\"action\":\"final\",\"answer\":\"...\"}}. Do not request, announce, or simulate another search or file read."
     )
 }
 
@@ -2866,16 +3024,22 @@ fn build_agent_loop_user(
     out.push_str(base_user);
     out.push_str("\n\nAvailable Agent tools for this turn:\n");
     if request.tools.wiki {
-        out.push_str("- wiki.search: retrieve wiki pages for factual or topical questions.\n");
-        out.push_str("- wiki.read_page: read a specific wiki markdown page by path.\n");
-        out.push_str("- source.search: search raw source snippets.\n");
-        out.push_str("- graph.search: retrieve relationships, neighbors, backlinks, dependencies, and connections between entities. Prefer it for relational questions and query with concise entity or concept names.\n");
-        out.push_str("- wiki.write_page: create a wiki markdown page when explicitly requested.\n");
+        if request.retrieval_mode == AgentRetrievalMode::Faithful {
+            out.push_str("- source.search: search raw source excerpts. This is the only retrieval tool permitted in faithful-source mode.\n");
+        } else {
+            out.push_str("- wiki.search: retrieve wiki pages for factual or topical questions.\n");
+            out.push_str("- wiki.read_page: read a specific wiki markdown page by path.\n");
+            out.push_str("- source.search: search raw source snippets.\n");
+            out.push_str("- graph.search: retrieve relationships, neighbors, backlinks, dependencies, and connections between entities. Prefer it for relational questions and query with concise entity or concept names.\n");
+            out.push_str(
+                "- wiki.write_page: create a wiki markdown page when explicitly requested.\n",
+            );
+        }
     }
-    if request.tools.web {
+    if request.tools.web && request.retrieval_mode != AgentRetrievalMode::Faithful {
         out.push_str("- web.search: search external web sources.\n");
     }
-    if request.tools.anytxt {
+    if request.tools.anytxt && request.retrieval_mode != AgentRetrievalMode::Faithful {
         out.push_str("- anytxt.search: search files indexed by AnyTXT.\n");
     }
     if !skills.is_empty() {
@@ -3357,6 +3521,16 @@ fn require_tool_permission(
     request: &AgentChatRequest,
     permission_policy: &PermissionPolicy,
 ) -> Result<(), String> {
+    if request.retrieval_mode == AgentRetrievalMode::Faithful
+        && matches!(
+            tool,
+            "wiki.search" | "wiki.read_page" | "graph.search" | "web.search" | "anytxt.search"
+        )
+    {
+        return Err(format!(
+            "{tool} is unavailable in faithful-source mode; use source.search"
+        ));
+    }
     match tool {
         "wiki.search" => {
             if !request.tools.wiki {
@@ -4001,6 +4175,8 @@ mod tests {
             reasoning: None,
             max_tokens: None,
             max_context_size: Some(8_000),
+            custom_headers: Default::default(),
+            streaming_enabled: None,
         };
         let fitted = fit_context_to_model(context, Some(&config));
         assert!(fitted.system.contains("system"));
@@ -4025,6 +4201,8 @@ mod tests {
             reasoning: None,
             max_tokens: None,
             max_context_size: Some(8_000),
+            custom_headers: Default::default(),
+            streaming_enabled: None,
         };
 
         let fitted = fit_context_to_model(context, Some(&config));
@@ -4460,12 +4638,152 @@ mod tests {
 
     #[test]
     fn retrieval_budget_expands_only_for_explicit_skill_turns() {
-        assert_eq!(agent_loop_retrieval_budget(AgentMode::Fast, false), 2);
-        assert_eq!(agent_loop_retrieval_budget(AgentMode::Standard, false), 4);
-        assert_eq!(agent_loop_retrieval_budget(AgentMode::LocalFirst, false), 4);
-        assert_eq!(agent_loop_retrieval_budget(AgentMode::Deep, false), 8);
-        assert_eq!(agent_loop_retrieval_budget(AgentMode::Standard, true), 8);
-        assert_eq!(agent_loop_retrieval_budget(AgentMode::Deep, true), 12);
+        assert_eq!(
+            agent_loop_retrieval_budget(AgentMode::Fast, AgentRetrievalMode::Standard, false),
+            2
+        );
+        assert_eq!(
+            agent_loop_retrieval_budget(AgentMode::Standard, AgentRetrievalMode::Standard, false),
+            4
+        );
+        assert_eq!(
+            agent_loop_retrieval_budget(AgentMode::LocalFirst, AgentRetrievalMode::Standard, false),
+            4
+        );
+        assert_eq!(
+            agent_loop_retrieval_budget(AgentMode::Deep, AgentRetrievalMode::Standard, false),
+            8
+        );
+        assert_eq!(
+            agent_loop_retrieval_budget(AgentMode::Standard, AgentRetrievalMode::Standard, true),
+            8
+        );
+        assert_eq!(
+            agent_loop_retrieval_budget(AgentMode::Deep, AgentRetrievalMode::Standard, true),
+            12
+        );
+        assert_eq!(
+            agent_loop_retrieval_budget(AgentMode::Standard, AgentRetrievalMode::Smart, false),
+            4
+        );
+        assert_eq!(
+            agent_loop_retrieval_budget(AgentMode::Deep, AgentRetrievalMode::Smart, true),
+            6
+        );
+        assert_eq!(
+            agent_loop_retrieval_budget(AgentMode::Standard, AgentRetrievalMode::Faithful, true),
+            3
+        );
+    }
+
+    #[test]
+    fn smart_retrieval_normalizes_equivalent_query_signatures() {
+        let left = serde_json::json!({"query": "Agent,   Runtime!", "topK": 5});
+        let right = serde_json::json!({"query": "agent runtime", "topK": 5});
+        assert_eq!(
+            retrieval_signature("wiki.search", &left, AgentRetrievalMode::Smart),
+            retrieval_signature("wiki.search", &right, AgentRetrievalMode::Smart),
+        );
+        assert_ne!(
+            retrieval_signature("wiki.search", &left, AgentRetrievalMode::Standard),
+            retrieval_signature("wiki.search", &right, AgentRetrievalMode::Standard),
+        );
+    }
+
+    #[test]
+    fn smart_retrieval_prompt_explains_bounded_evidence_loop() {
+        let prompt = build_agent_loop_system("base", AgentRetrievalMode::Smart);
+        assert!(prompt.contains("bounded evidence loop"));
+        assert!(prompt.contains("Do not repeat equivalent queries"));
+        assert!(
+            !build_agent_loop_system("base", AgentRetrievalMode::Standard)
+                .contains("bounded evidence loop")
+        );
+    }
+
+    #[test]
+    fn faithful_retrieval_prompt_limits_answer_evidence_to_raw_sources() {
+        let request = AgentChatRequest {
+            retrieval_mode: AgentRetrievalMode::Faithful,
+            ..AgentChatRequest::default()
+        };
+        let loop_system = build_agent_loop_system("base", request.retrieval_mode);
+        let loop_user = build_agent_loop_user("question", &request, &[], &[], 0, 8, false);
+        let final_system = build_agent_final_system("base", request.retrieval_mode);
+
+        assert!(loop_system.contains("Answer only from raw source excerpts"));
+        assert!(loop_system.contains("state that limitation instead of reconstructing or guessing"));
+        assert!(loop_user.contains("only retrieval tool permitted"));
+        assert!(!loop_user.contains("- wiki.search:"));
+        assert!(!loop_user.contains("- graph.search:"));
+        assert!(final_system.contains("Faithful-source mode remains in force"));
+    }
+
+    #[test]
+    fn faithful_retrieval_removes_ambient_generated_project_context() {
+        let project = crate::agent::context::ProjectContext {
+            overview: Some("generated overview evidence".to_string()),
+            schema: Some("domain schema evidence".to_string()),
+            agent_workspace: "/project/agent-workspace".to_string(),
+        };
+
+        let faithful =
+            project_context_for_retrieval_mode(project.clone(), AgentRetrievalMode::Faithful);
+        let standard =
+            project_context_for_retrieval_mode(project.clone(), AgentRetrievalMode::Standard);
+
+        assert!(faithful.overview.is_none());
+        assert!(faithful.schema.is_none());
+        assert_eq!(faithful.agent_workspace, project.agent_workspace);
+        assert_eq!(standard, project);
+
+        let router = route_query(
+            "quote the original",
+            AgentMode::Standard,
+            &AgentToolOptions::default(),
+        );
+        let built = build_agent_context(AgentContextInput {
+            query: "quote the original",
+            project: &faithful,
+            router: &router,
+            history: &[],
+            skills: &[],
+            skill_mode: AgentSkillMode::Auto,
+            references: &[],
+            retrieval_summary: "",
+            explicit_files: &[],
+        });
+        assert!(!built.system.contains("generated overview evidence"));
+        assert!(!built.system.contains("domain schema evidence"));
+        assert!(built.system.contains("/project/agent-workspace"));
+    }
+
+    #[test]
+    fn smart_retrieval_counts_page_reads_but_not_repeated_searches_as_new_evidence() {
+        assert!(retrieval_added_evidence(
+            "wiki.search",
+            "1 result(s), 1 new",
+            0,
+            1
+        ));
+        assert!(!retrieval_added_evidence(
+            "wiki.search",
+            "1 result(s), 0 new",
+            1,
+            1
+        ));
+        assert!(retrieval_added_evidence(
+            "wiki.read_page",
+            "read wiki/a.md\npage content",
+            1,
+            1
+        ));
+        assert!(!retrieval_added_evidence(
+            "wiki.read_page",
+            "read wiki/a.md\n",
+            1,
+            1
+        ));
     }
 
     #[test]
@@ -4477,7 +4795,7 @@ mod tests {
 
     #[test]
     fn finalization_prompt_removes_tool_choice() {
-        let system = build_agent_final_system("base");
+        let system = build_agent_final_system("base", AgentRetrievalMode::Standard);
         let user = build_agent_final_user(
             "question",
             &[AgentObservation {
@@ -4827,6 +5145,33 @@ mod tests {
         assert!(require_tool_permission("anytxt.search", &request, &policy)
             .unwrap_err()
             .contains("disabled"));
+    }
+
+    #[test]
+    fn faithful_retrieval_permission_rejects_non_source_evidence_tools() {
+        let request = AgentChatRequest {
+            retrieval_mode: AgentRetrievalMode::Faithful,
+            tools: AgentToolOptions {
+                wiki: true,
+                web: true,
+                anytxt: true,
+            },
+            ..AgentChatRequest::default()
+        };
+        let policy = PermissionPolicy::api_default();
+
+        assert!(require_tool_permission("source.search", &request, &policy).is_ok());
+        for tool in [
+            "wiki.search",
+            "wiki.read_page",
+            "graph.search",
+            "web.search",
+            "anytxt.search",
+        ] {
+            assert!(require_tool_permission(tool, &request, &policy)
+                .unwrap_err()
+                .contains("faithful-source mode"));
+        }
     }
 
     #[test]

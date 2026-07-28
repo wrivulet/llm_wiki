@@ -15,6 +15,25 @@ impl Default for AgentMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRetrievalMode {
+    // Preserve the established single-pass/planner-driven retrieval behavior.
+    Standard,
+    // Let the Agent iteratively close evidence gaps under a strict retrieval
+    // budget and no-progress guard.
+    Smart,
+    // Use only raw source excerpts as answer evidence. This is explicit user
+    // intent, never inferred from wording or language-specific heuristics.
+    Faithful,
+}
+
+impl Default for AgentRetrievalMode {
+    fn default() -> Self {
+        Self::Standard
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentToolOptions {
@@ -77,6 +96,8 @@ pub struct AgentChatRequest {
     #[serde(default)]
     pub mode: AgentMode,
     #[serde(default)]
+    pub retrieval_mode: AgentRetrievalMode,
+    #[serde(default)]
     pub tools: AgentToolOptions,
     #[serde(default)]
     pub top_k: Option<usize>,
@@ -125,6 +146,7 @@ impl Default for AgentChatRequest {
             session_id: None,
             run_id: None,
             mode: AgentMode::default(),
+            retrieval_mode: AgentRetrievalMode::default(),
             tools: AgentToolOptions::default(),
             top_k: None,
             include_content: None,
@@ -280,6 +302,7 @@ mod tests {
         assert_eq!(req.session_id.as_deref(), Some("s1"));
         assert!(req.run_id.is_none());
         assert_eq!(req.mode, AgentMode::Standard);
+        assert_eq!(req.retrieval_mode, AgentRetrievalMode::Standard);
         assert_eq!(req.top_k, Some(7));
         assert_eq!(req.context_files, vec!["wiki/page.md".to_string()]);
         assert_eq!(req.skill_mode, AgentSkillMode::Explicit);
@@ -294,6 +317,7 @@ mod tests {
         let req: AgentChatRequest = serde_json::from_value(serde_json::json!({
             "message": "hello",
             "mode": "local_first",
+            "retrievalMode": "smart",
             "tools": {
                 "wiki": false,
                 "web": true,
@@ -303,10 +327,22 @@ mod tests {
         .unwrap();
 
         assert_eq!(req.mode, AgentMode::LocalFirst);
+        assert_eq!(req.retrieval_mode, AgentRetrievalMode::Smart);
         assert!(!req.tools.wiki);
         assert!(req.tools.web);
         assert!(req.tools.anytxt);
         assert!(req.images.is_empty());
+    }
+
+    #[test]
+    fn chat_request_accepts_faithful_retrieval_mode() {
+        let req: AgentChatRequest = serde_json::from_value(serde_json::json!({
+            "message": "quote the source",
+            "retrievalMode": "faithful"
+        }))
+        .unwrap();
+
+        assert_eq!(req.retrieval_mode, AgentRetrievalMode::Faithful);
     }
 
     #[test]

@@ -23,6 +23,15 @@ export async function fetch(
     init?.headers ?? (input instanceof Request ? input.headers : undefined),
   )
   headers.set("x-llmwiki-target-url", url)
+  // Same reasoning as rpc.ts's rpcCall(): without a header telling
+  // oauth2-proxy this is an API call, an expired session 302s to the
+  // IdP login page, fetch() follows it into a cross-origin CORS dead
+  // end, and the LLM call fails with a bare "Failed to fetch" that
+  // looks exactly like the LLM endpoint being unreachable. Forwarded
+  // to the target LLM too, but every real LLM API ignores unknown
+  // headers, so this is harmless there.
+  headers.set("X-Requested-With", "XMLHttpRequest")
+  if (!headers.has("Accept")) headers.set("Accept", "application/json")
 
   // Tauri-specific options (connectTimeout, …) have no browser
   // equivalent and are dropped; signal/method/body pass through.

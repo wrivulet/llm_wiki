@@ -32,7 +32,7 @@
 # Authorization: Bearer,并自带 TLS(复用同一张服务证书)。
 services:
   llm-wiki:
-    image: da2.example.internal:9350/llm-wiki-web:0.6.1
+    image: da2.example.internal:9350/llm-wiki-web:0.6.6
     init: true
     stop_grace_period: 30s
     networks:
@@ -148,7 +148,9 @@ services:
       OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE: /etc/oauth2/kb1-users.txt
       OAUTH2_PROXY_INSECURE_OIDC_ALLOW_UNVERIFIED_EMAIL: "true"
       OAUTH2_PROXY_COOKIE_SECURE: "true"
-      OAUTH2_PROXY_COOKIE_EXPIRE: 8h
+      # 与 oauth2-clients-llm-wiki.yml 的 refresh-token-ttl-minutes 对齐;
+      # ingest 是浏览器驱动的前端任务,批量导入耗时可能超过原先的 8 小时
+      OAUTH2_PROXY_COOKIE_EXPIRE: 24h
       OAUTH2_PROXY_COOKIE_REFRESH: 25m
       # 关键:SSE 事件流(/events)需要即时刷出
       OAUTH2_PROXY_FLUSH_INTERVAL: 1s

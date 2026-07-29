@@ -36,5 +36,10 @@ clients:
     # oauth2-proxy 会校验 ID Token 并可调用 /userinfo,JWT 格式最稳妥
     access-token-format: self-contained
     access-token-ttl-minutes: 30
-    refresh-token-ttl-minutes: 480
-    overwrite: false
+    # 文档批量导入(ingest)是浏览器标签页驱动的前端逻辑,不是后台任务——
+    # 大批量导入耗时可能超过默认的 8 小时,届时刷新令牌本身过期,
+    # 无论 oauth2-proxy 怎么静默刷新都救不回来,只能重新登录。
+    # 调这个值需要用 overwrite: true 重跑 OAuth2ClientRegistrar 覆盖既有客户端,
+    # 同时把 docker-stack.yml 里 oauth2-proxy 的 OAUTH2_PROXY_COOKIE_EXPIRE 调到一致。
+    refresh-token-ttl-minutes: 1440
+    overwrite: true

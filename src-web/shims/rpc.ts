@@ -41,13 +41,43 @@ export class RpcError extends Error {
   }
 }
 
+/**
+ * Thrown when oauth2-proxy has already rejected the request with a
+ * clean 401 (see the X-Requested-With header below) — i.e. the
+ * browser's session expired mid-use. Distinct from a generic RpcError
+ * so callers/UI can tell "log in again" apart from "something broke."
+ */
+export const SESSION_EXPIRED_MESSAGE =
+  "Your session has expired. Please refresh the page and sign in again."
+
 export async function rpcCall<T>(path: string, body?: unknown, method = "POST"): Promise<T> {
   const res = await fetch(`${RPC_BASE}${path}`, {
     method,
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      // Without these, an expired oauth2-proxy session 302s to the IdP
+      // login page instead of returning 401. fetch() follows that
+      // redirect by default, lands on a cross-origin page with no CORS
+      // headers, and the promise rejects with a bare "Failed to fetch"
+      // — indistinguishable from the target LLM endpoint being down,
+      // and the reason a stale-session failure kept getting misread as
+      // an LLM/embedding connectivity problem. These two headers are
+      // the standard "this is an API call, not a browser navigation"
+      // signal auth proxies (oauth2-proxy included) check before
+      // deciding whether to redirect or just 401.
+      "Accept": "application/json",
+      "X-Requested-With": "XMLHttpRequest",
+    },
     body: body === undefined ? undefined : JSON.stringify(body),
     credentials: "same-origin",
   })
+  if (res.status === 401) {
+    // This endpoint has no auth of its own (that's entirely
+    // oauth2-proxy's job) — a 401 here can only be oauth2-proxy
+    // rejecting an expired session, never something our own bridge
+    // emits, so it's unambiguous.
+    throw SESSION_EXPIRED_MESSAGE
+  }
   const text = await res.text()
   if (!res.ok) {
     let message = text

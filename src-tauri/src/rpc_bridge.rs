@@ -1230,7 +1230,7 @@ fn content_type_for(path: &Path) -> &'static str {
         .as_str()
     {
         "html" => "text/html; charset=utf-8",
-        "js" => "text/javascript",
+        "js" | "mjs" => "text/javascript",
         "css" => "text/css",
         "json" => "application/json",
         "svg" => "image/svg+xml",

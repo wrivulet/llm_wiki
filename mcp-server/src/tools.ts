@@ -21,20 +21,30 @@ import { VERSION } from "./version.js"
 const DEFAULT_PROJECT_ID = "current"
 
 /**
- * Externally-reachable base URL for the web bridge's /asset endpoint
- * (e.g. https://dbp.test.example.internal:7180), used to turn a cited
- * raw source into a clickable "view original document" link in search
+ * Externally-reachable base URL for the web build (e.g.
+ * https://dbp.test.example.internal:7180), used to turn a cited raw
+ * source into a clickable "view original document" link in search
  * results. Unset by default: stdio/desktop callers have no such
  * endpoint (that's a web-build-only concept), so omitting the env var
  * silently drops the links rather than emitting ones that 404.
  */
 const PUBLIC_ASSET_BASE_URL = process.env.LLM_WIKI_PUBLIC_URL?.trim().replace(/\/+$/, "")
 
-function assetLink(projectPath: string, relativeSourcePath: string): string | null {
+/**
+ * Deep-links into the SPA itself (?openProject=...&openFile=...,
+ * handled by App.tsx's init effect) rather than a bare /asset?path=
+ * download — that way a cited PDF/doc opens through the app's own
+ * preview (pdf.js, image viewer, etc.) instead of the browser's native
+ * PDF plugin or a Save-As prompt. Both params are absolute filesystem
+ * paths, same convention the app's own openPathInPreview() uses.
+ */
+function previewLink(projectPath: string, relativeSourcePath: string): string | null {
   if (!PUBLIC_ASSET_BASE_URL) return null
   const absolutePath = `${projectPath.replace(/\/+$/, "")}/${relativeSourcePath}`
-  return `${PUBLIC_ASSET_BASE_URL}/asset?path=${encodeURIComponent(absolutePath)}`
+  const params = new URLSearchParams({ openProject: projectPath, openFile: absolutePath })
+  return `${PUBLIC_ASSET_BASE_URL}/?${params.toString()}`
 }
+
 const MAX_TEXT_BYTES = 120_000
 
 /**
@@ -467,7 +477,7 @@ function formatSearchResults(
     }
     if (result.sources && result.sources.length > 0 && project) {
       const links = result.sources.map((source) => {
-        const link = assetLink(project.path, source)
+        const link = previewLink(project.path, source)
         return link ? `[${source}](${link})` : source
       })
       lines.push(`Original source(s): ${links.join(", ")}`)

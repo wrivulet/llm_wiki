@@ -385,14 +385,29 @@ function App() {
         if (savedLang) {
           await i18n.changeLanguage(savedLang)
         }
-        const lastProject = await getLastProject()
-        if (lastProject) {
+        // Deep-link entry point (web build only in practice — desktop's
+        // webview never carries query params): the MCP citation link
+        // opens the SPA at ?openProject=<abs path>&openFile=<abs path>
+        // instead of a bare /asset download, so a cited PDF/doc gets the
+        // app's own preview (pdf.js, image viewer, etc.) rather than the
+        // browser's native PDF plugin or a Save-As prompt.
+        const deepLinkParams = new URLSearchParams(window.location.search)
+        const deepLinkProjectPath = deepLinkParams.get("openProject")
+        const deepLinkFilePath = deepLinkParams.get("openFile")
+        const targetProjectPath = deepLinkProjectPath ?? (await getLastProject())?.path
+        if (targetProjectPath) {
           try {
-            const proj = await openProject(lastProject.path)
+            const proj = await openProject(targetProjectPath)
             await handleProjectOpened(proj)
+            if (deepLinkFilePath) {
+              useWikiStore.getState().openPathInPreview(deepLinkFilePath)
+            }
           } catch {
             // Last project no longer valid
           }
+        }
+        if (deepLinkProjectPath || deepLinkFilePath) {
+          window.history.replaceState(null, "", window.location.pathname)
         }
       } catch {
         // ignore init errors

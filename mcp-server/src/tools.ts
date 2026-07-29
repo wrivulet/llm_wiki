@@ -41,7 +41,10 @@ const PUBLIC_ASSET_BASE_URL = process.env.LLM_WIKI_PUBLIC_URL?.trim().replace(/\
 function previewLink(projectPath: string, relativeSourcePath: string): string | null {
   if (!PUBLIC_ASSET_BASE_URL) return null
   const absolutePath = `${projectPath.replace(/\/+$/, "")}/${relativeSourcePath}`
-  const params = new URLSearchParams({ openProject: projectPath, openFile: absolutePath })
+  // embed=1: bare document view (App.tsx's embedMode), no icon sidebar /
+  // file tree / update banner — a citation click just wants the cited
+  // document, not a detour into the full app.
+  const params = new URLSearchParams({ openProject: projectPath, openFile: absolutePath, embed: "1" })
   return `${PUBLIC_ASSET_BASE_URL}/?${params.toString()}`
 }
 

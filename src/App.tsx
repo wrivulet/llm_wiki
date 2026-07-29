@@ -14,6 +14,7 @@ import { loadReviewItems, loadLintItems, loadChatHistory, loadChatPreferences } 
 import { setupAutoSave } from "@/lib/auto-save"
 import { startClipWatcher } from "@/lib/clip-watcher"
 import { AppLayout } from "@/components/layout/app-layout"
+import { PreviewPanel } from "@/components/layout/preview-panel"
 import { WelcomeScreen } from "@/components/project/welcome-screen"
 import { CreateProjectDialog } from "@/components/project/create-project-dialog"
 import type { WikiProject } from "@/types/wiki"
@@ -31,6 +32,12 @@ function App() {
   const zoomLevel = useZoomStore((s) => s.level)
   const [showCreateDialog, setShowCreateDialog] = useState(false)
   const [loading, setLoading] = useState(true)
+  // Set once during the deep-link init effect below (?embed=1). When
+  // true, the final render skips AppLayout's icon sidebar / file tree /
+  // update banner entirely and shows just the file preview — the MCP
+  // citation link wants "here's the cited document," not a detour into
+  // the full app chrome.
+  const [embedMode, setEmbedMode] = useState(false)
 
   function isCurrentProject(proj: WikiProject): boolean {
     const current = useWikiStore.getState().project
@@ -394,6 +401,7 @@ function App() {
         const deepLinkParams = new URLSearchParams(window.location.search)
         const deepLinkProjectPath = deepLinkParams.get("openProject")
         const deepLinkFilePath = deepLinkParams.get("openFile")
+        const deepLinkEmbed = deepLinkParams.get("embed") === "1"
         const targetProjectPath = deepLinkProjectPath ?? (await getLastProject())?.path
         if (targetProjectPath) {
           try {
@@ -401,6 +409,7 @@ function App() {
             await handleProjectOpened(proj)
             if (deepLinkFilePath) {
               useWikiStore.getState().openPathInPreview(deepLinkFilePath)
+              if (deepLinkEmbed) setEmbedMode(true)
             }
           } catch {
             // Last project no longer valid
@@ -592,6 +601,18 @@ function App() {
     return (
       <div className="flex h-full items-center justify-center bg-background text-muted-foreground">
         Loading...
+      </div>
+    )
+  }
+
+  // MCP citation link (?embed=1): just the cited document, none of the
+  // surrounding app chrome (icon sidebar, file tree, update banner).
+  // Falls through to the normal views below if the deep-link project
+  // failed to open, rather than showing a dead-end blank screen.
+  if (embedMode && project) {
+    return (
+      <div className="h-full">
+        <PreviewPanel />
       </div>
     )
   }

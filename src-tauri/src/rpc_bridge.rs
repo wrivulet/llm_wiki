@@ -911,7 +911,20 @@ const SKIP_RESPONSE_HEADERS: &[&str] = &[
 fn proxy_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        let mut builder = reqwest::Client::builder().connect_timeout(PROXY_CONNECT_TIMEOUT);
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(PROXY_CONNECT_TIMEOUT)
+            // This client is a process-lifetime singleton serving every LLM
+            // call (ingest included) for as long as the container runs.
+            // Corporate HTTP proxies commonly kill idle CONNECT tunnels
+            // well under reqwest's ~90s pool_idle_timeout default; reusing
+            // one after the proxy has silently dropped it fails with a
+            // generic connection reset that looks identical to "the LLM
+            // endpoint is unreachable" — while a fresh curl (new
+            // connection every time) keeps working. Disabling idle-pool
+            // reuse trades a per-request TCP/TLS handshake for immunity
+            // to that "works, then degrades over a long session" failure
+            // mode entirely.
+            .pool_max_idle_per_host(0);
         // 企业内网的 LLM/搜索端点常由内部 CA 签发;rustls 默认只信任
         // webpki 公共根。通过 PEM bundle 追加信任锚(须为 CA 证书)。
         if let Ok(path) = std::env::var("LLM_WIKI_PROXY_EXTRA_CA") {

@@ -42,4 +42,10 @@ clients:
     # 调这个值需要用 overwrite: true 重跑 OAuth2ClientRegistrar 覆盖既有客户端,
     # 同时把 docker-stack.yml 里 oauth2-proxy 的 OAUTH2_PROXY_COOKIE_EXPIRE 调到一致。
     refresh-token-ttl-minutes: 1440
+    # false=轮换(internal-idp 自身默认值,这里显式写出仅为自解释):每次刷新
+    # access_token 都会同时发一个全新的 refresh_token,有效期从那一刻重新
+    # 计算——只要用户还在活跃使用就不断顺延,不会被固定的 24 小时窗口卡死。
+    # 若改成 true(复用同一个 refresh_token),到期时间从首次登录时就固定
+    # 死了,不管中途多活跃都不会延长,大批量导入更容易撞上这个硬截止点。
+    reuse-refresh-tokens: false
     overwrite: true

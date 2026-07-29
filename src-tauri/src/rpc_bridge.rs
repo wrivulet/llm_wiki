@@ -32,11 +32,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -72,6 +73,7 @@ pub fn start_rpc_bridge(app: AppHandle) {
         .route("/upload", post(handle_upload))
         .route("/proxy", any(handle_proxy))
         .fallback(get(handle_static))
+        .layer(middleware::from_fn(log_requests))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES as usize))
         .with_state(app.clone());
 
@@ -88,6 +90,29 @@ pub fn start_rpc_bridge(app: AppHandle) {
             eprintln!("[RPC Bridge] server error: {err}");
         }
     });
+}
+
+/// Access log for every request through the bridge. Without this,
+/// stdout/stderr only ever showed the handful of startup lines — real
+/// traffic (ingest, chat, search, LLM calls via /proxy) happened
+/// silently, making `docker service logs` useless for watching what
+/// the container is actually doing. Method + path + status + latency
+/// only: request/response bodies can carry API keys, file contents, or
+/// chat text, so they're deliberately never logged. For a streamed
+/// response (SSE, /proxy passthrough) this fires once the handler
+/// returns the response object — i.e. when the stream starts, not when
+/// it eventually closes — which is the useful moment to log anyway.
+async fn log_requests(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let started = Instant::now();
+    let response = next.run(req).await;
+    eprintln!(
+        "[RPC Bridge] {method} {path} -> {} ({:.1}ms)",
+        response.status().as_u16(),
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    response
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {

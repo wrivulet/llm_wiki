@@ -50,3 +50,10 @@ pnpm-debug.log*
 # Brainstorm assets (not tracked in source control)
 .superpowers/
 .claude/
+
+# Real deployment values (real domains/hostnames, project names) for
+# deploy/web/*. The tracked files are templates with placeholder values
+# safe to keep in this public repo; copy each to its .local.* variant
+# and fill in the real values before deploying — see deploy/web/README.md.
+deploy/web/*.local.yml
+deploy/web/*.local.cfg

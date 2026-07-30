@@ -27,6 +27,29 @@ oauth2-proxy 对接 internal-idp(OIDC)完成。
   Web 工作在 `web` 分支,定期 `git merge main`。
 - 上游改动命令签名时,`rpc_bridge.rs` 的分发表会编译失败,按编译错误跟进即可。
 
+## 真实部署值:模板文件 + .local 覆盖(此仓库是公开 fork)
+
+`docker-stack.yml`、`oauth2-proxy.cfg`、`oauth2-clients-llm-wiki.yml` 里的域名
+(`example.internal`)、IdP 项目名(`internal-idp`)等都是**占位符**——本仓库
+是上游项目的公开 fork,不能把内部域名/主机名提交进去。
+
+真正部署时:
+
+```bash
+cp deploy/web/docker-stack.yml deploy/web/docker-stack.local.yml
+cp deploy/web/oauth2-proxy.cfg deploy/web/oauth2-proxy.local.cfg
+cp deploy/web/oauth2-clients-llm-wiki.yml deploy/web/oauth2-clients-llm-wiki.local.yml
+# 编辑这三个 .local.* 文件,把占位符换成真实值
+```
+
+`*.local.yml`/`*.local.cfg` 已加入 `.gitignore`,不会被提交。部署/运行时把
+下文命令里的文件名换成对应的 `.local.*` 版本(如
+`docker stack deploy -c deploy/web/docker-stack.local.yml llm-wiki`)。
+
+**维护提醒**:以后这三个模板文件结构变化(新增/改名字段)时,记得手动把
+同样的改动同步到你自己的 `.local.*` 文件里——这几个文件不支持自动合并,
+`.local.*` 是完整复制而非增量补丁,改了模板不会自动带过去。
+
 ## Docker 部署(推荐)
 
 ```bash

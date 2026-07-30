@@ -42,10 +42,14 @@ clients:
     # 调这个值需要用 overwrite: true 重跑 OAuth2ClientRegistrar 覆盖既有客户端,
     # 同时把 docker-stack.yml 里 oauth2-proxy 的 OAUTH2_PROXY_COOKIE_EXPIRE 调到一致。
     refresh-token-ttl-minutes: 1440
-    # false=轮换(internal-idp 自身默认值,这里显式写出仅为自解释):每次刷新
-    # access_token 都会同时发一个全新的 refresh_token,有效期从那一刻重新
-    # 计算——只要用户还在活跃使用就不断顺延,不会被固定的 24 小时窗口卡死。
-    # 若改成 true(复用同一个 refresh_token),到期时间从首次登录时就固定
-    # 死了,不管中途多活跃都不会延长,大批量导入更容易撞上这个硬截止点。
-    reuse-refresh-tokens: false
+    # true=复用同一个 refresh_token(推翻了之前"改成轮换换取滑动过期"的
+    # 结论)。实测轮换模式(false)下,ingest 跑约 3 小时就随机性地话话话
+    # 提前失效——3 小时不对应任何一个已配置的有效期,指向轮换模式下的
+    # 经典并发竞态:ingest 前后脚发出的并发请求都拿同一个(即将被替换的)
+    # refresh_token 去换新的,轮换会让先成功的那个使旧 token 立即失效,
+    # 后到的请求随之失败,会话被判死且不会恢复。复用模式下自始至终只有
+    # 一个有效的 refresh_token 值,不存在这类竞态,代价是回到固定的
+    # 24 小时窗口(不再随活跃度顺延)——但比"理论上能顺延、实际上撑不到
+    # 3 小时就随机失效"可靠得多。
+    reuse-refresh-tokens: true
     overwrite: true

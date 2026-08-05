@@ -53,10 +53,10 @@ pub struct ProjectSearchResult {
     /// frontmatter `sources:` list cites, resolved against an on-disk
     /// scan (see build_source_index) so callers — the web MCP bridge in
     /// particular — can link straight to the original document instead
-    /// of just the LLM-generated wiki summary. Best-effort: falls back
-    /// to `raw/sources/<name>` verbatim if the name isn't found on disk
-    /// (e.g. deleted after ingest), so a case that predates this field
-    /// degrades to a plausible-but-unverified path rather than nothing.
+    /// of just the LLM-generated wiki summary. Only citations that
+    /// actually matched a file on disk are included (see
+    /// resolve_cited_sources); an unresolved name is dropped rather
+    /// than guessed, so this list never contains a link known to 404.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<String>,
 }
@@ -1148,19 +1148,21 @@ fn extract_frontmatter_sources(content: &str) -> Vec<String> {
 }
 
 /// Resolves a page's cited source names against the project's source
-/// index. Unresolved names (e.g. the source was deleted after ingest)
-/// still get a best-effort `raw/sources/<name>` path rather than being
-/// dropped, so a stale link is preferred over silently losing the
-/// citation.
+/// index. A name that doesn't match any file on disk is dropped rather
+/// than falling back to a guessed `raw/sources/<name>` path: ingest has
+/// been observed writing near-duplicate `sources:` entries for the same
+/// document (e.g. a cleaned-up title-derived variant alongside the real
+/// filename) where the variant string never corresponded to an actual
+/// file, so a naive fallback produced a citation link that was
+/// guaranteed to 404. Losing a citation silently is preferable to
+/// serving a broken one. Also dedupes, since two frontmatter variants
+/// commonly resolve to the same real file.
 fn resolve_cited_sources(content: &str, source_index: &BTreeMap<String, String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
     extract_frontmatter_sources(content)
         .into_iter()
-        .map(|name| {
-            source_index
-                .get(&name.to_lowercase())
-                .cloned()
-                .unwrap_or_else(|| format!("raw/sources/{name}"))
-        })
+        .filter_map(|name| source_index.get(&name.to_lowercase()).cloned())
+        .filter(|resolved| seen.insert(resolved.clone()))
         .collect()
 }
 

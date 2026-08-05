@@ -155,7 +155,7 @@ export function createServer(): Server {
           properties: {
             project_id: { type: "string", description: "Project UUID, project path, project name, or 'current'. Defaults to current." },
             query: { type: "string", description: "Search query." },
-            top_k: { type: "number", description: "Maximum results. The local API clamps to its configured maximum." },
+            top_k: { type: "number", description: "Maximum results, up to 50. Defaults to 50 for this MCP tool (higher than the desktop UI's default) so relevant files are less likely to be missed." },
             include_content: { type: "boolean", description: "Include full page content in results when supported by the API." },
           },
           required: ["query"],
@@ -274,7 +274,11 @@ export function createServer(): Server {
           const query = stringArg(args.query, "query")
           const scope = await resolveProjectScope(client, projectBinding, args)
           const search = await client.search(scope.id, query, {
-            topK: numberArg(args.top_k),
+            // Default to the API's max (50), not its 20-result desktop-UI
+            // default: an LLM agent asking one-shot questions is much more
+            // likely than the interactive UI to miss a relevant file at a
+            // shallow top_k, and the model frequently omits this argument.
+            topK: numberArg(args.top_k) ?? 50,
             includeContent: boolArg(args.include_content, false),
           })
           return textResult(withActiveProject(formatSearchResults(query, search, scope.project), scope.project, scope.id))

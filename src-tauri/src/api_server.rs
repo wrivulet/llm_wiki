@@ -1965,33 +1965,104 @@ fn handle_graph(app: &AppHandle, project_id: &str, query: &str) -> ApiResponse {
     }
 }
 
+// Wikis backed by a network filesystem (GlusterFS/NFS mounts are common in
+// this app's Docker deployments) can have tens of thousands of pages; each
+// synchronous file read pays a real per-call round trip over FUSE, so a
+// cold build_graph() there can run for minutes rather than seconds — long
+// enough to blow past a remote MCP client's own call timeout. The cache
+// makes repeat calls (an LLM agent calling llm_wiki_graph more than once
+// in a conversation, or a UI re-render) near-instant; parallelizing the
+// read phase cuts the unavoidable cold-call latency roughly by the worker
+// count, since the bottleneck is I/O wait, not CPU.
+const GRAPH_CACHE_TTL: Duration = Duration::from_secs(60);
+const GRAPH_READ_THREADS: usize = 8;
+
+type GraphCacheEntry = (Instant, Vec<ApiGraphNode>, Vec<ApiGraphEdge>);
+static GRAPH_CACHE: OnceLock<Mutex<BTreeMap<String, GraphCacheEntry>>> = OnceLock::new();
+
 fn build_graph(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdge>), String> {
+    let cache = GRAPH_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some((cached_at, nodes, edges)) = guard.get(project_path) {
+            if cached_at.elapsed() < GRAPH_CACHE_TTL {
+                return Ok((nodes.clone(), edges.clone()));
+            }
+        }
+    }
+
+    let result = build_graph_uncached(project_path)?;
+
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(
+            project_path.to_string(),
+            (Instant::now(), result.0.clone(), result.1.clone()),
+        );
+    }
+    Ok(result)
+}
+
+fn build_graph_uncached(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdge>), String> {
     let wiki_root = Path::new(project_path).join("wiki");
+
+    // Phase 1: directory traversal to collect markdown paths. Listing
+    // directory entries is comparatively cheap even over FUSE; it's
+    // reading each file's *content* that dominates for a large wiki.
+    let md_paths: Vec<PathBuf> = WalkDir::new(&wiki_root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry.path().extension().and_then(|s| s.to_str()) == Some("md")
+        })
+        .map(|entry| entry.into_path())
+        .collect();
+
+    // Phase 2: read + parse file contents across a bounded worker pool.
+    // Purely I/O-bound (waiting on the filesystem), so this parallelizes
+    // well without needing an async runtime — this module is synchronous
+    // tiny_http, unlike the web bridge's axum/tokio side.
+    let chunk_size = md_paths.len().div_ceil(GRAPH_READ_THREADS).max(1);
+    let mut parsed: Vec<(String, String, String, String, Vec<String>)> =
+        Vec::with_capacity(md_paths.len());
+    thread::scope(|scope| {
+        let handles: Vec<_> = md_paths
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for path in chunk {
+                        let Ok(content) = fs::read_to_string(path) else {
+                            continue;
+                        };
+                        let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                            continue;
+                        };
+                        if id.is_empty() {
+                            continue;
+                        }
+                        let file_name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let title = commands::search::extract_title(&content, &file_name);
+                        let node_type = extract_type(&content);
+                        let rel_path = relative_to_project(project_path, path);
+                        let links = extract_wikilinks(&content);
+                        out.push((id.to_string(), title, node_type, rel_path, links));
+                    }
+                    out
+                })
+            })
+            .collect();
+        for handle in handles {
+            if let Ok(chunk_result) = handle.join() {
+                parsed.extend(chunk_result);
+            }
+        }
+    });
+
     let mut raw: BTreeMap<String, (String, String, String, Vec<String>)> = BTreeMap::new();
-    for entry in WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file()
-            || entry.path().extension().and_then(|s| s.to_str()) != Some("md")
-        {
-            continue;
-        }
-        let content = match fs::read_to_string(entry.path()) {
-            Ok(content) => content,
-            Err(_) => continue,
-        };
-        let id = entry
-            .path()
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        if id.is_empty() {
-            continue;
-        }
-        let title =
-            commands::search::extract_title(&content, entry.file_name().to_string_lossy().as_ref());
-        let node_type = extract_type(&content);
-        let path = relative_to_project(project_path, entry.path());
-        let links = extract_wikilinks(&content);
+    for (id, title, node_type, path, links) in parsed {
         raw.insert(id, (title, node_type, path, links));
     }
     let ids: BTreeSet<String> = raw.keys().cloned().collect();

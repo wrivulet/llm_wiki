@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -167,36 +169,61 @@ pub async fn get_page_links(
         .map_err(|err| format!("page links worker failed: {err}"))?
 }
 
-/// Build link relationships from Markdown source rather than the UI's lazy
-/// file tree. Canonical paths enforce the project/wiki boundary, while the
-/// returned paths stay project-relative so all desktop platforms share one
-/// wire format and Windows separators never leak into frontend routing.
-fn get_page_links_inner(project_path: &str, file_path: &str) -> Result<PageLinksResponse, String> {
-    let project = fs::canonicalize(project_path)
-        .map_err(|err| format!("Failed to resolve project path: {err}"))?;
-    let file =
-        fs::canonicalize(file_path).map_err(|err| format!("Failed to resolve page path: {err}"))?;
-    let wiki_root = project.join("wiki");
-    if !file.starts_with(&wiki_root)
-        || !file.is_file()
-        || file.extension().and_then(|value| value.to_str()) != Some("md")
-    {
-        return Err("Page links target must be an existing Markdown file under wiki/".to_string());
+// A wiki page's full text is loaded to score search matches, extract
+// backlinks, etc., so this cache keeps `GraphPage` (path/title/content/links)
+// rather than something lighter. On a large wiki over a slow network mount
+// (see GRAPH_CACHE in api_server.rs for the same problem on the graph
+// endpoint), re-walking and re-reading up to MAX_SEARCH_FILES markdown files
+// on every search or page-links call was both slow and, worse, a steady
+// source of memory churn: each call allocated on the order of the whole
+// corpus's text just to throw it away moments later, which in production
+// ratcheted the process toward its container memory limit and got OOM-killed
+// every several hours. Sharing one TTL-cached index (via Arc, so repeat
+// callers don't even pay a clone) turns that into one walk per cache window.
+const PAGE_INDEX_CACHE_TTL: Duration = Duration::from_secs(60);
+type PageIndex = BTreeMap<String, GraphPage>;
+static PAGE_INDEX_CACHE: OnceLock<Mutex<BTreeMap<String, (Instant, Arc<PageIndex>)>>> =
+    OnceLock::new();
+
+fn build_page_index(project_path: &str) -> Arc<PageIndex> {
+    let cache = PAGE_INDEX_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some((cached_at, pages)) = guard.get(project_path) {
+            if cached_at.elapsed() < PAGE_INDEX_CACHE_TTL {
+                return Arc::clone(pages);
+            }
+        }
     }
 
-    let mut pages = BTreeMap::<String, GraphPage>::new();
-    let canonical_project = project.to_string_lossy();
+    let pages = Arc::new(build_page_index_uncached(project_path));
+
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(project_path.to_string(), (Instant::now(), Arc::clone(&pages)));
+    }
+    pages
+}
+
+fn build_page_index_uncached(project_path: &str) -> PageIndex {
+    let wiki_root = Path::new(project_path).join("wiki");
+    let mut pages = BTreeMap::new();
+    let mut searched_files = 0usize;
     for entry in WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
-        if pages.len() >= MAX_SEARCH_FILES
-            || !entry.file_type().is_file()
+        if !entry.file_type().is_file()
             || entry.path().extension().and_then(|value| value.to_str()) != Some("md")
         {
             continue;
         }
+        searched_files += 1;
+        if searched_files > MAX_SEARCH_FILES {
+            eprintln!(
+                "[Search] stopped scanning wiki after {MAX_SEARCH_FILES} markdown files in {project_path}"
+            );
+            break;
+        }
         let Ok(content) = fs::read_to_string(entry.path()) else {
             continue;
         };
-        let path = relative_to_project(&canonical_project, entry.path());
+        let path = relative_to_project(project_path, entry.path());
         let title = extract_title(
             &content,
             entry
@@ -215,6 +242,28 @@ fn get_page_links_inner(project_path: &str, file_path: &str) -> Result<PageLinks
             },
         );
     }
+    pages
+}
+
+/// Build link relationships from Markdown source rather than the UI's lazy
+/// file tree. Canonical paths enforce the project/wiki boundary, while the
+/// returned paths stay project-relative so all desktop platforms share one
+/// wire format and Windows separators never leak into frontend routing.
+fn get_page_links_inner(project_path: &str, file_path: &str) -> Result<PageLinksResponse, String> {
+    let project = fs::canonicalize(project_path)
+        .map_err(|err| format!("Failed to resolve project path: {err}"))?;
+    let file =
+        fs::canonicalize(file_path).map_err(|err| format!("Failed to resolve page path: {err}"))?;
+    let wiki_root = project.join("wiki");
+    if !file.starts_with(&wiki_root)
+        || !file.is_file()
+        || file.extension().and_then(|value| value.to_str()) != Some("md")
+    {
+        return Err("Page links target must be an existing Markdown file under wiki/".to_string());
+    }
+
+    let canonical_project = project.to_string_lossy().to_string();
+    let pages = build_page_index(&canonical_project);
 
     let current_path = normalize_path(&relative_to_project(&canonical_project, &file));
     let current = pages
@@ -223,7 +272,7 @@ fn get_page_links_inner(project_path: &str, file_path: &str) -> Result<PageLinks
     let mut outgoing = Vec::new();
     let mut missing = Vec::new();
     for link in &current.links {
-        if let Some(target_path) = resolve_reader_wikilink(&pages, link) {
+        if let Some(target_path) = resolve_reader_wikilink(pages.as_ref(), link) {
             if target_path.as_str() == current_path {
                 continue;
             }
@@ -244,12 +293,12 @@ fn get_page_links_inner(project_path: &str, file_path: &str) -> Result<PageLinks
     }
 
     let mut backlinks = Vec::new();
-    for (path, page) in &pages {
+    for (path, page) in pages.as_ref() {
         if path == &current_path {
             continue;
         }
         let links_here = page.links.iter().any(|link| {
-            resolve_reader_wikilink(&pages, link)
+            resolve_reader_wikilink(pages.as_ref(), link)
                 .is_some_and(|target| target.as_str() == current_path)
         });
         if links_here {
@@ -350,74 +399,39 @@ pub async fn search_project_inner(
     let query_phrase = trim_query_punctuation(&query.to_lowercase());
     let mut results = Vec::new();
     let mut page_paths_by_stem = BTreeMap::new();
-    let mut graph_pages = BTreeMap::new();
     let source_index = build_source_index(&project_path);
 
     let wiki_root = Path::new(&project_path).join("wiki");
-    if wiki_root.exists() {
-        let mut searched_files = 0usize;
-        for entry in WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file()
-                || entry.path().extension().and_then(|s| s.to_str()) != Some("md")
-            {
-                continue;
-            }
-            searched_files += 1;
-            if searched_files > MAX_SEARCH_FILES {
-                eprintln!(
-                    "[Search] stopped scanning wiki after {MAX_SEARCH_FILES} markdown files in {project_path}"
-                );
-                break;
-            }
-            let content = match fs::read_to_string(entry.path()) {
-                Ok(content) => content,
-                Err(_) => continue,
-            };
-            if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
-                let previous = page_paths_by_stem.insert(
-                    stem.to_string(),
-                    relative_to_project(&project_path, entry.path()),
-                );
+    let graph_pages = if wiki_root.exists() {
+        let index = build_page_index(&project_path);
+        for page in index.values() {
+            if let Some(stem) = Path::new(&page.path).file_stem().and_then(|s| s.to_str()) {
+                let previous = page_paths_by_stem.insert(stem.to_string(), page.path.clone());
                 if let Some(previous) = previous {
                     eprintln!(
                         "[Search] duplicate wiki page stem '{stem}': '{previous}' and '{}' share one vector page_id",
-                        relative_to_project(&project_path, entry.path())
+                        page.path
                     );
                 }
             }
-            let relative_path = relative_to_project(&project_path, entry.path());
-            let title = extract_title(
-                &content,
-                entry
-                    .path()
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or_default(),
-            );
             let hit = score_file(
                 &project_path,
-                entry.path(),
-                &content,
+                Path::new(&page.path),
+                &page.content,
                 &effective_tokens,
                 &query_phrase,
                 &query,
                 include_content,
                 &source_index,
             );
-            graph_pages.insert(
-                normalize_path(&relative_path),
-                GraphPage {
-                    path: relative_path,
-                    title,
-                    links: extract_wikilinks(&content),
-                    content,
-                },
-            );
             if let Some(hit) = hit {
                 results.push(hit);
             }
         }
-    }
+        index
+    } else {
+        Arc::new(BTreeMap::new())
+    };
 
     let mut token_sorted = (0..results.len()).collect::<Vec<_>>();
     token_sorted.sort_by(|a, b| {
@@ -475,7 +489,7 @@ pub async fn search_project_inner(
     });
     let graph_hits = blend_graph_results(
         &mut results,
-        &graph_pages,
+        graph_pages.as_ref(),
         limit,
         vector_hits,
         include_content,

@@ -296,6 +296,13 @@ struct ProjectPathArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SweepSourcesArgs {
+    project_path: String,
+    apply: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct FileTaskArgs {
     project_id: String,
     project_path: String,
@@ -572,6 +579,10 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Disp
         "get_page_links" => {
             let a: FileRefArgs = parse(args)?;
             done(search::get_page_links(a.project_path, a.file_path).await)
+        }
+        "sweep_source_citations" => {
+            let a: SweepSourcesArgs = parse(args)?;
+            done(search::sweep_source_citations(a.project_path, a.apply).await)
         }
         "apply_text_selection_edit" => {
             let a: SelectionEditArgs = parse(args)?;

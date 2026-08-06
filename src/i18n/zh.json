@@ -852,6 +852,16 @@
           "exported": "项目已导出到 {{path}}",
           "imported": "已导入 {{name}}，请切换项目后打开。"
         },
+        "sourceCitations": {
+          "title": "清理失效的原文引用",
+          "description": "wiki 页面的 frontmatter 有时会引用一个在 raw/sources/ 下找不到对应文件的来源名（通常是生成时 LLM 转写长文件名/标点时出的偏差，中文长文件名尤其常见）。先扫描找出受影响的页面，确认后才会真正写入文件。",
+          "scan": "扫描",
+          "apply": "修复 {{count}} 个页面",
+          "applied": "已修复 {{scanned}} 个页面中的 {{count}} 个。",
+          "clean": "扫描了 {{scanned}} 个页面，未发现失效引用。",
+          "found": "{{scanned}} 个页面中有 {{count}} 个包含匹配不上真实文件的引用。",
+          "removedLabel": "已移除"
+        },
         "dedup": {
           "title": "检测重复实体 / 概念",
           "description": "让 LLM 扫描全部 entity / concept 页面，把可能指向同一主题但用了不同名字的页面分组（中英对照、单复数、缩写与全称等）。每一组都需要你确认后才会合并。合并任务会进入串行队列依次执行，避免交叉引用被并发改写覆盖。",

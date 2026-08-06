@@ -169,6 +169,99 @@ pub async fn get_page_links(
         .map_err(|err| format!("page links worker failed: {err}"))?
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SweepSourcesEntry {
+    pub path: String,
+    pub removed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SweepSourcesReport {
+    pub scanned: usize,
+    pub changed: Vec<SweepSourcesEntry>,
+}
+
+/// Scans every wiki page's frontmatter `sources:` citations against the
+/// project's actual raw/sources/ files. Ingest has been observed writing
+/// near-duplicate citations for the same document (see resolve_cited_sources)
+/// where one variant never matches any real file — this repairs pages that
+/// already exist with that stale data baked into their frontmatter, which
+/// resolve_cited_sources alone can't fix since it only filters at read time.
+/// `apply: false` is a dry run so a maintenance UI can show what would
+/// change before committing to file writes.
+#[tauri::command]
+pub async fn sweep_source_citations(
+    project_path: String,
+    apply: bool,
+) -> Result<SweepSourcesReport, String> {
+    tokio::task::spawn_blocking(move || sweep_source_citations_inner(&project_path, apply))
+        .await
+        .map_err(|err| format!("source citation sweep worker failed: {err}"))?
+}
+
+fn sweep_source_citations_inner(
+    project_path: &str,
+    apply: bool,
+) -> Result<SweepSourcesReport, String> {
+    let source_index = build_source_index(project_path);
+    let wiki_root = Path::new(project_path).join("wiki");
+    let mut scanned = 0usize;
+    let mut changed = Vec::new();
+
+    for entry in WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file()
+            || entry.path().extension().and_then(|s| s.to_str()) != Some("md")
+        {
+            continue;
+        }
+        scanned += 1;
+        let Ok(content) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let original_names = extract_frontmatter_sources(&content);
+        if original_names.is_empty() {
+            continue;
+        }
+
+        // A name that resolves is kept verbatim (not replaced with the
+        // resolved path — frontmatter conventionally stores bare
+        // filenames); a name that doesn't match anything, or duplicates
+        // a file another entry already resolved to, gets dropped.
+        let mut seen_targets = BTreeSet::new();
+        let mut valid_names = Vec::new();
+        let mut removed = Vec::new();
+        for name in &original_names {
+            match source_index.get(&name.to_lowercase()) {
+                Some(target) if seen_targets.insert(target.clone()) => {
+                    valid_names.push(name.clone())
+                }
+                _ => removed.push(name.clone()),
+            }
+        }
+        if removed.is_empty() {
+            continue;
+        }
+
+        let relative_path = relative_to_project(project_path, entry.path());
+        if apply {
+            let Some(rewritten) = rewrite_frontmatter_sources(&content, &valid_names) else {
+                continue;
+            };
+            if fs::write(entry.path(), rewritten).is_err() {
+                continue;
+            }
+        }
+        changed.push(SweepSourcesEntry {
+            path: relative_path,
+            removed,
+        });
+    }
+
+    Ok(SweepSourcesReport { scanned, changed })
+}
+
 // A wiki page's full text is loaded to score search matches, extract
 // backlinks, etc., so this cache keeps `GraphPage` (path/title/content/links)
 // rather than something lighter. On a large wiki over a slow network mount
@@ -1145,6 +1238,71 @@ fn extract_frontmatter_sources(content: &str) -> Vec<String> {
         }
     }
     names
+}
+
+/// Rewrites a wiki page's frontmatter `sources:` field in place, replacing
+/// whichever form (inline or multi-line block) it used with a canonical
+/// inline list of exactly `new_names`. Returns `None` if the page has no
+/// frontmatter or no `sources:` field to replace — callers should treat
+/// that as "nothing to do" rather than an error, since sweep only calls
+/// this after extract_frontmatter_sources already found a field there.
+fn rewrite_frontmatter_sources(content: &str, new_names: &[String]) -> Option<String> {
+    if !content.starts_with("---\n") {
+        return None;
+    }
+    let fm_end_rel = content[4..].find("\n---")?;
+    let frontmatter = &content[4..4 + fm_end_rel];
+
+    let mut field_start = None;
+    let mut field_end = None;
+    let mut in_sources_block = false;
+    let mut offset = 0usize;
+    for line in frontmatter.split_inclusive('\n') {
+        let bare = line.strip_suffix('\n').unwrap_or(line);
+        if let Some(rest) = bare.strip_prefix("sources:") {
+            field_start.get_or_insert(offset);
+            field_end = Some(offset + line.len());
+            in_sources_block = rest.trim().is_empty();
+            offset += line.len();
+            continue;
+        }
+        if in_sources_block {
+            if bare.trim().is_empty() || bare.starts_with(' ') || bare.starts_with('\t') {
+                field_end = Some(offset + line.len());
+                offset += line.len();
+                continue;
+            }
+            in_sources_block = false;
+        }
+        offset += line.len();
+    }
+    let (start, end) = (field_start?, field_end?);
+
+    let quoted = new_names
+        .iter()
+        .map(|name| format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // frontmatter never includes its own trailing newline before the
+    // closing `\n---` (see fm_end_rel above), so when the sources field is
+    // the last one, `end == frontmatter.len()` and there's no line after
+    // it to terminate — content[4 + fm_end_rel..] already supplies that
+    // exact newline via the delimiter. Adding one here too would leave a
+    // spurious blank line before `---`.
+    let field_is_last = end == frontmatter.len();
+    let replacement = if field_is_last {
+        format!("sources: [{quoted}]")
+    } else {
+        format!("sources: [{quoted}]\n")
+    };
+
+    let mut rewritten = String::with_capacity(content.len());
+    rewritten.push_str(&content[..4]);
+    rewritten.push_str(&frontmatter[..start]);
+    rewritten.push_str(&replacement);
+    rewritten.push_str(&frontmatter[end..]);
+    rewritten.push_str(&content[4 + fm_end_rel..]);
+    Some(rewritten)
 }
 
 /// Resolves a page's cited source names against the project's source
@@ -2379,5 +2537,102 @@ mod tests {
         assert!(parse_embedding_batch_values(&response, 2)
             .unwrap_err()
             .contains("duplicate"));
+    }
+
+    #[test]
+    fn rewrites_inline_sources_field_dropping_and_keeping_by_name() {
+        let content = "---\ntitle: X\nsources: [\"a.doc\", \"b.doc\"]\ntags: [x]\n---\nbody";
+        let rewritten =
+            rewrite_frontmatter_sources(content, &["a.doc".to_string()]).unwrap();
+        assert_eq!(
+            rewritten,
+            "---\ntitle: X\nsources: [\"a.doc\"]\ntags: [x]\n---\nbody"
+        );
+    }
+
+    #[test]
+    fn rewrites_block_sources_field_to_inline_form() {
+        let content = "---\ntitle: X\nsources:\n  - \"a.doc\"\n  - \"b.doc\"\ntags: [x]\n---\nbody";
+        let rewritten =
+            rewrite_frontmatter_sources(content, &["a.doc".to_string()]).unwrap();
+        assert_eq!(
+            rewritten,
+            "---\ntitle: X\nsources: [\"a.doc\"]\ntags: [x]\n---\nbody"
+        );
+    }
+
+    #[test]
+    fn rewrites_to_empty_sources_list() {
+        let content = "---\ntitle: X\nsources: [\"a.doc\"]\n---\nbody";
+        let rewritten = rewrite_frontmatter_sources(content, &[]).unwrap();
+        assert_eq!(rewritten, "---\ntitle: X\nsources: []\n---\nbody");
+    }
+
+    #[test]
+    fn rewrite_returns_none_without_sources_field() {
+        let content = "---\ntitle: X\n---\nbody";
+        assert!(rewrite_frontmatter_sources(content, &["a.doc".to_string()]).is_none());
+    }
+
+    #[test]
+    fn sweep_drops_unresolvable_citation_in_dry_run_without_touching_disk() {
+        let root = tmp_project();
+        fs::create_dir_all(root.join("raw/sources")).unwrap();
+        fs::write(root.join("raw/sources/real.doc"), b"x").unwrap();
+        let page = "---\ntitle: X\nsources: [\"real.doc\", \"corrupted variant.doc\"]\n---\nbody";
+        write_page(&root, "wiki/concepts/x.md", page);
+
+        let report =
+            sweep_source_citations_inner(root.to_string_lossy().as_ref(), false).unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.changed.len(), 1);
+        assert_eq!(report.changed[0].removed, vec!["corrupted variant.doc"]);
+        // Dry run: file on disk must be untouched.
+        assert_eq!(fs::read_to_string(root.join("wiki/concepts/x.md")).unwrap(), page);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sweep_apply_rewrites_file_and_dedupes_by_resolved_target() {
+        let root = tmp_project();
+        fs::create_dir_all(root.join("raw/sources")).unwrap();
+        fs::write(root.join("raw/sources/real.doc"), b"x").unwrap();
+        // Two frontmatter entries that both resolve to the same real file
+        // (case-insensitive match) — only one should survive.
+        let page = "---\ntitle: X\nsources: [\"real.doc\", \"REAL.DOC\", \"missing.doc\"]\n---\nbody";
+        write_page(&root, "wiki/concepts/x.md", page);
+
+        let report =
+            sweep_source_citations_inner(root.to_string_lossy().as_ref(), true).unwrap();
+        assert_eq!(report.changed.len(), 1);
+        assert_eq!(
+            report.changed[0].removed,
+            vec!["REAL.DOC".to_string(), "missing.doc".to_string()]
+        );
+
+        let rewritten = fs::read_to_string(root.join("wiki/concepts/x.md")).unwrap();
+        assert_eq!(rewritten, "---\ntitle: X\nsources: [\"real.doc\"]\n---\nbody");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sweep_skips_pages_whose_citations_all_resolve() {
+        let root = tmp_project();
+        fs::create_dir_all(root.join("raw/sources")).unwrap();
+        fs::write(root.join("raw/sources/real.doc"), b"x").unwrap();
+        write_page(
+            &root,
+            "wiki/concepts/x.md",
+            "---\ntitle: X\nsources: [\"real.doc\"]\n---\nbody",
+        );
+
+        let report =
+            sweep_source_citations_inner(root.to_string_lossy().as_ref(), true).unwrap();
+        assert_eq!(report.scanned, 1);
+        assert!(report.changed.is_empty());
+
+        let _ = fs::remove_dir_all(root);
     }
 }

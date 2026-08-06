@@ -13,6 +13,7 @@ import {
   Clock,
   Archive,
   ListRestart,
+  Link2Off,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
@@ -34,6 +35,16 @@ import type { DuplicateGroup } from "@/lib/dedup"
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 import { openProject } from "@/commands/fs"
 import { addToRecentProjects } from "@/lib/project-store"
+
+interface SweepSourcesEntry {
+  path: string
+  removed: string[]
+}
+
+interface SweepSourcesReport {
+  scanned: number
+  changed: SweepSourcesEntry[]
+}
 
 interface GroupUiEntry {
   group: DuplicateGroup
@@ -63,6 +74,30 @@ export function MaintenanceSection() {
   const [scanCompleted, setScanCompleted] = useState(false)
   const [projectToolStatus, setProjectToolStatus] = useState<string | null>(null)
   const [projectToolBusy, setProjectToolBusy] = useState(false)
+
+  const [sweepReport, setSweepReport] = useState<SweepSourcesReport | null>(null)
+  const [sweepBusy, setSweepBusy] = useState(false)
+  const [sweepApplied, setSweepApplied] = useState(false)
+
+  const runSweep = useCallback(
+    async (apply: boolean) => {
+      if (!project) return
+      setSweepBusy(true)
+      try {
+        const report = await invoke<SweepSourcesReport>("sweep_source_citations", {
+          projectPath: project.path,
+          apply,
+        })
+        setSweepReport(report)
+        setSweepApplied(apply)
+      } catch (error) {
+        setProjectToolStatus(String(error))
+      } finally {
+        setSweepBusy(false)
+      }
+    },
+    [project],
+  )
 
   const handleRebuildIndex = useCallback(async () => {
     if (!project) return
@@ -276,6 +311,72 @@ export function MaintenanceSection() {
           <Button variant="outline" onClick={() => void handleImportProject()} disabled={projectToolBusy}>{t("settings.sections.maintenance.projectData.import")}</Button>
         </div>
         {projectToolStatus && <p className="text-xs text-muted-foreground">{projectToolStatus}</p>}
+      </div>
+
+      <div className="space-y-3 rounded-lg border border-border/60 bg-muted/20 p-4">
+        <div className="flex items-center gap-2">
+          <Link2Off className="h-4 w-4 text-muted-foreground" />
+          <h3 className="text-sm font-semibold">
+            {t("settings.sections.maintenance.sourceCitations.title", {
+              defaultValue: "Clean up broken source citations",
+            })}
+          </h3>
+        </div>
+        <p className="text-xs leading-relaxed text-muted-foreground">
+          {t("settings.sections.maintenance.sourceCitations.description", {
+            defaultValue:
+              "Wiki pages sometimes end up with a frontmatter source citation that doesn't match any file under raw/sources/ (usually an LLM transcription slip during generation, most visible on long punctuated filenames). Scan finds affected pages first; nothing is written until you apply.",
+          })}
+        </p>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="outline" onClick={() => void runSweep(false)} disabled={!project || sweepBusy}>
+            {sweepBusy && !sweepApplied ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+            {t("settings.sections.maintenance.sourceCitations.scan", { defaultValue: "Scan" })}
+          </Button>
+          {sweepReport && sweepReport.changed.length > 0 && !sweepApplied && (
+            <Button onClick={() => void runSweep(true)} disabled={sweepBusy}>
+              {sweepBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+              {t("settings.sections.maintenance.sourceCitations.apply", {
+                defaultValue: "Fix {{count}} page(s)",
+                count: sweepReport.changed.length,
+              })}
+            </Button>
+          )}
+        </div>
+        {sweepReport && (
+          <p className="text-xs text-muted-foreground">
+            {sweepApplied
+              ? t("settings.sections.maintenance.sourceCitations.applied", {
+                  defaultValue: "Fixed {{count}} of {{scanned}} scanned page(s).",
+                  count: sweepReport.changed.length,
+                  scanned: sweepReport.scanned,
+                })
+              : sweepReport.changed.length === 0
+                ? t("settings.sections.maintenance.sourceCitations.clean", {
+                    defaultValue: "No broken citations found across {{scanned}} page(s).",
+                    scanned: sweepReport.scanned,
+                  })
+                : t("settings.sections.maintenance.sourceCitations.found", {
+                    defaultValue: "{{count}} of {{scanned}} page(s) have a citation that doesn't match a real file.",
+                    count: sweepReport.changed.length,
+                    scanned: sweepReport.scanned,
+                  })}
+          </p>
+        )}
+        {sweepReport && sweepReport.changed.length > 0 && (
+          <ul className="max-h-40 space-y-1 overflow-y-auto text-xs">
+            {sweepReport.changed.map((entry) => (
+              <li key={entry.path} className="rounded border border-border/40 bg-background px-2 py-1">
+                <code className="font-mono">{entry.path}</code>
+                <span className="text-muted-foreground">
+                  {" — "}
+                  {t("settings.sections.maintenance.sourceCitations.removedLabel", { defaultValue: "dropped" })}:{" "}
+                </span>
+                {entry.removed.join(", ")}
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
 
       <div className="space-y-3 rounded-lg border border-border/60 bg-muted/20 p-4">

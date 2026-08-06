@@ -653,6 +653,7 @@ pub fn run() {
             commands::search::embedding_fetch,
             commands::search::embedding_fetch_batch,
             commands::search::get_page_links,
+            commands::search::sweep_source_citations,
             commands::external_search::web_search,
             commands::external_search::anytxt_search,
             clip_server_status,

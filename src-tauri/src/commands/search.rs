@@ -226,14 +226,15 @@ fn sweep_source_citations_inner(
         }
 
         // A name that resolves is kept verbatim (not replaced with the
-        // resolved path — frontmatter conventionally stores bare
-        // filenames); a name that doesn't match anything, or duplicates
-        // a file another entry already resolved to, gets dropped.
+        // resolved path — frontmatter stores either a bare filename or a
+        // path relative to raw/sources/, and either form should stay as
+        // written); a name that doesn't match anything, or duplicates a
+        // file another entry already resolved to, gets dropped.
         let mut seen_targets = BTreeSet::new();
         let mut valid_names = Vec::new();
         let mut removed = Vec::new();
         for name in &original_names {
-            match source_index.get(&name.to_lowercase()) {
+            match source_index.get(&normalize_path(name).to_lowercase()) {
                 Some(target) if seen_targets.insert(target.clone()) => {
                     valid_names.push(name.clone())
                 }
@@ -249,9 +250,25 @@ fn sweep_source_citations_inner(
             let Some(rewritten) = rewrite_frontmatter_sources(&content, &valid_names) else {
                 continue;
             };
+            // Snapshot before/after like every other write path in this
+            // codebase (see fs.rs's write_file/write_file_atomic) so a
+            // wrong sweep — e.g. a matching bug that drops citations it
+            // shouldn't — is recoverable from the file history panel
+            // instead of being a silent, unrecoverable mutation.
+            crate::commands::file_sync::mark_app_write_path(entry.path());
+            crate::commands::file_history::record_file_version(
+                entry.path(),
+                "baseline",
+                "before.maintenance.sweep_source_citations",
+            );
             if fs::write(entry.path(), rewritten).is_err() {
                 continue;
             }
+            crate::commands::file_history::record_file_version(
+                entry.path(),
+                "human",
+                "maintenance.sweep_source_citations",
+            );
         }
         changed.push(SweepSourcesEntry {
             path: relative_path,
@@ -1175,11 +1192,25 @@ fn build_source_index(project_path: &str) -> BTreeMap<String, String> {
         let Some(name) = entry.path().file_name().and_then(|n| n.to_str()) else {
             continue;
         };
+        let target = relative_to_project(project_path, entry.path());
+        // Basename-only key: matches a bare-filename citation regardless
+        // of which raw/sources/ subfolder the file actually lives in.
         // First match wins on a duplicate basename in different
         // subfolders — good enough for a best-effort citation link.
         index
             .entry(name.to_lowercase())
-            .or_insert_with(|| relative_to_project(project_path, entry.path()));
+            .or_insert_with(|| target.clone());
+        // Path-relative-to-raw/sources/ key: ingest sometimes writes a
+        // citation that already includes the subfolder (e.g.
+        // "sub/dir/file.md") rather than a bare filename. Without this,
+        // any such citation can never match — a basename-only index
+        // compares the whole string, so a name containing '/' never
+        // equals a basename key even when it correctly names a real file,
+        // and every citation in that page's frontmatter gets dropped.
+        if let Ok(rel_to_sources) = entry.path().strip_prefix(&sources_root) {
+            let key = normalize_path(&rel_to_sources.to_string_lossy()).to_lowercase();
+            index.entry(key).or_insert(target);
+        }
     }
     index
 }
@@ -1319,7 +1350,7 @@ fn resolve_cited_sources(content: &str, source_index: &BTreeMap<String, String>)
     let mut seen = BTreeSet::new();
     extract_frontmatter_sources(content)
         .into_iter()
-        .filter_map(|name| source_index.get(&name.to_lowercase()).cloned())
+        .filter_map(|name| source_index.get(&normalize_path(&name).to_lowercase()).cloned())
         .filter(|resolved| seen.insert(resolved.clone()))
         .collect()
 }
@@ -2632,6 +2663,28 @@ mod tests {
             sweep_source_citations_inner(root.to_string_lossy().as_ref(), true).unwrap();
         assert_eq!(report.scanned, 1);
         assert!(report.changed.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sweep_keeps_citations_that_include_a_raw_sources_subfolder() {
+        // Regression test: ingest sometimes writes a citation as a path
+        // relative to raw/sources/ (with a subfolder) rather than a bare
+        // filename. build_source_index used to only key by basename, so a
+        // citation containing '/' could never match anything on disk —
+        // wiping every citation on the page even when they were correct.
+        let root = tmp_project();
+        fs::create_dir_all(root.join("raw/sources/0-party-docs")).unwrap();
+        fs::write(root.join("raw/sources/0-party-docs/real.md"), b"x").unwrap();
+        let page = "---\ntitle: X\nsources: [\"0-party-docs/real.md\"]\n---\nbody";
+        write_page(&root, "wiki/concepts/x.md", page);
+
+        let report =
+            sweep_source_citations_inner(root.to_string_lossy().as_ref(), true).unwrap();
+        assert_eq!(report.scanned, 1);
+        assert!(report.changed.is_empty(), "changed: {:?}", report.changed);
+        assert_eq!(fs::read_to_string(root.join("wiki/concepts/x.md")).unwrap(), page);
 
         let _ = fs::remove_dir_all(root);
     }
